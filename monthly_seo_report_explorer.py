@@ -1067,6 +1067,22 @@ def build_pptx(template_path, out_path, month_name, year, week_groups, summary_t
     n_original = len(prs.slides._sldIdLst)
     slide_w = prs.slide_width
 
+    # The conclusion slide is the LAST slide of the ORIGINAL template,
+    # not a fixed index — a hardcoded "100" assumed every template has
+    # at least 101 slides, which crashed immediately on any normal,
+    # reasonably-sized upload (confirmed: this raised exactly the
+    # reported IndexError on a real template). A template only needs to
+    # actually have a title, a week-divider, a result layout, and a
+    # final conclusion slide — order matters, exact slide COUNT doesn't.
+    idx_conclusion = n_original - 1
+    min_needed = IDX_RESULT + 2  # room for a conclusion slide after the result layout
+    if n_original < min_needed:
+        raise ValueError(
+            f"This template has only {n_original} slide(s), but at least {min_needed} are "
+            f"needed: a title slide, a week-divider slide, a result-layout slide, and a "
+            f"final conclusion slide, in that order. Please use a template with more slides."
+        )
+
     title_slide = duplicate_slide(prs, IDX_TITLE)
     set_title_text(title_slide, "SEO REPORT")
     for shp in title_slide.shapes:
@@ -1091,7 +1107,7 @@ def build_pptx(template_path, out_path, month_name, year, week_groups, summary_t
                 ("Part", f"{entry['part']} of {entry['of']}"),
             ])
 
-    concl = duplicate_slide(prs, IDX_CONCLUSION)
+    concl = duplicate_slide(prs, idx_conclusion)
     set_body_text(concl, summary_text)
 
     for i in range(n_original - 1, -1, -1):
