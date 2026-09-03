@@ -73,8 +73,24 @@ from pptx.oxml.ns import qn
 from pptx.util import Pt
 from pptx.dml.color import RGBColor
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox, scrolledtext
+except ImportError:
+    # Headless environments (Streamlit Cloud included) often don't have
+    # tkinter's underlying _tkinter C extension compiled in at all — but
+    # the GUI classes below (ChoiceDialog, App) are ONLY ever
+    # instantiated by run_app(), which nothing outside the standalone
+    # desktop script calls. A lightweight stand-in lets the module still
+    # import cleanly for its detection/build functions (which is all a
+    # web-app caller ever needs) without requiring tkinter to actually
+    # be present. Every tk.X / ttk.X reference below only resolves at
+    # class-definition time as a base class, or inside method bodies
+    # that never run unless the desktop GUI is actually launched.
+    class _MissingTkModule:
+        def __getattr__(self, name):
+            return object
+    tk = ttk = filedialog = messagebox = scrolledtext = _MissingTkModule()
 
 _WIN_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 pytesseract.pytesseract.tesseract_cmd = os.environ.get(
