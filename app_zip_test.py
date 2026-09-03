@@ -208,7 +208,7 @@ def render_review_step():
         with st.expander(
             f"{status_icon} **{entry['keyword']}** · Page {entry['page']} · Week {entry['week_num']} · "
             f"{entry['date']} · {entry['file']} — {len(entry['row_coords'])} row(s), {flagged_n} flagged",
-            expanded=False,
+            expanded=False, key=f"expander_{idx}",
         ):
             bcol1, bcol2 = st.columns([1, 3])
             with bcol1:
