@@ -912,8 +912,9 @@ def pgno_label(page: int, numbers: list[int]) -> str:
     return f"Pg{page}#{','.join(str(n) for n in numbers)}"
 
 
-def build_csv_rows(csv_results):
-    rows = [HEADER]
+def build_csv_rows(csv_results, report_type="Explorer"):
+    rows = [["Report Type:", report_type], []]
+    rows.append(HEADER)
     for label in ROW_ORDER:
         keyword = ROW_LABEL_TO_KEYWORD.get(label)
         row = [label]
@@ -927,11 +928,12 @@ def build_csv_rows(csv_results):
     return rows
 
 
-def write_csv_report(report_root, csv_results, filename="main file.csv"):
+def write_csv_report(report_root, csv_results, month_name, year, report_type="Explorer"):
+    filename = f"{report_type}_SEO_Report_{month_name}_{year}.csv"
     os.makedirs(report_root, exist_ok=True)
     report_path = os.path.join(report_root, filename)
     with open(report_path, 'w', newline='', encoding='utf-8') as f:
-        csv.writer(f).writerows(build_csv_rows(csv_results))
+        csv.writer(f).writerows(build_csv_rows(csv_results, report_type))
     return report_path
 
 
@@ -1057,7 +1059,11 @@ def replace_picture(slide, image_path, slide_width):
         width = zone_width
         height = int(width / aspect)
 
-    left = slide_width - width - RIGHT_MARGIN
+    # Left-aligned within the picture zone (growing rightward from just
+    # after the metadata-text column), not right-aligned to the slide's
+    # far edge — screenshots should read left-to-right like everything
+    # else on the slide, not anchor to the right margin.
+    left = zone_left
     top = CONTENT_TOP + (CONTENT_HEIGHT - height) // 2
     slide.shapes.add_picture(image_path, left, top, width=width, height=height)
 
@@ -1254,7 +1260,7 @@ def build_report_from_manifest(report_root, manifest, template_path=None, extra_
     for w in week_groups:
         week_groups[w].sort(key=lambda e: (e["day"], e["keyword"], e["page"], e["part"]))
 
-    csv_path = write_csv_report(report_root, csv_results)
+    csv_path = write_csv_report(report_root, csv_results, manifest["month_name"], manifest["year"], "Explorer")
 
     pptx_path = None
     template_path = template_path or manifest.get("template_path")
