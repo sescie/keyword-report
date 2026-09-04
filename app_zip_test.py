@@ -28,12 +28,6 @@ from PIL import Image
 import monthly_seo_report_google as google_core
 import monthly_seo_report_explorer as explorer_core
 
-try:
-    from streamlit_drawable_canvas import st_canvas
-    HAS_CANVAS = True
-except ImportError:
-    HAS_CANVAS = False
-
 MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
@@ -182,10 +176,6 @@ def render_review_step():
                "correct anything that needs it below before building.")
     st.divider()
 
-    if st.session_state["editing_entry_idx"] is not None:
-        render_crop_editor(manifest["entries"][st.session_state["editing_entry_idx"]])
-        return
-
     filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
     keywords = sorted({e["keyword"] for e in manifest["entries"]})
     weeks = sorted({e["week_num"] for e in manifest["entries"]})
@@ -220,12 +210,6 @@ def render_review_step():
             f"{entry['date']} · {entry['file']} — {len(entry['row_coords'])} row(s), {flagged_n} flagged",
             expanded=False, key=f"expander_{idx}",
         ):
-            bcol1, bcol2 = st.columns([1, 3])
-            with bcol1:
-                if st.button("✏️ Edit rows visually", key=f"editbtn_{idx}", width="stretch"):
-                    st.session_state["editing_entry_idx"] = idx
-                    st.rerun()
-
             for rc in sorted(entry["row_coords"], key=lambda r: r["top"]):
                 c1, c2, c3 = st.columns([0.14, 0.1, 0.76])
                 with c1:
@@ -243,6 +227,35 @@ def render_review_step():
                 with c3:
                     st.image(_row_thumb(entry, rc), width="stretch")
 
+            with st.expander("➕ Add a row this missed (enter pixel positions)"):
+                raw_h = Image.open(entry["raw_filepath"]).height
+                c1, c2, c3 = st.columns([1, 1, 1])
+                with c1:
+                    new_top = st.number_input("Top", min_value=0, max_value=raw_h, value=0,
+                                               key=f"newtop_{idx}")
+                with c2:
+                    new_bottom = st.number_input("Bottom", min_value=0, max_value=raw_h,
+                                                  value=min(200, raw_h), key=f"newbot_{idx}")
+                with c3:
+                    st.write("")
+                    st.write("")
+                    if st.button("Add row", key=f"addrow_{idx}"):
+                        if new_bottom > new_top:
+                            new_num = (max((r["row"] for r in entry["row_coords"]), default=0)) + 1
+                            entry["row_coords"].append(
+                                {"row": new_num, "top": int(new_top), "bottom": int(new_bottom), "flagged": False})
+                            _renumber(entry)
+                            _commit(entry)
+                            st.rerun()
+                        else:
+                            st.error("Bottom must be greater than top.")
+                # a live preview of what this range currently looks like,
+                # so picking the right numbers doesn't require guessing blind
+                if new_bottom > new_top:
+                    raw = Image.open(entry["raw_filepath"]).convert("RGB")
+                    preview = raw.crop((0, int(new_top), entry["x_right"], int(new_bottom)))
+                    st.image(preview, caption="Preview of this range", width="stretch")
+
     st.divider()
     if st.button("🚀 Build Report", type="primary"):
         # A fresh build must run EVERY time this is clicked, including
@@ -258,68 +271,6 @@ def render_review_step():
         st.session_state.pop("build_summary", None)
         st.session_state["step"] = "build"
         st.rerun()
-
-
-def render_crop_editor(entry):
-    st.subheader(f"Visual editor — {entry['file']}")
-    st.caption("Draw a rectangle over an existing row to redraw its boundary. "
-               "Draw in empty space to add a row detection missed.")
-
-    if not HAS_CANVAS:
-        st.warning("Visual dragging isn't available right now — you can still flag/delete "
-                   "rows on the main review screen.")
-        if st.button("◀ Back to review"):
-            st.session_state["editing_entry_idx"] = None
-            st.rerun()
-        return
-
-    raw = Image.open(entry["raw_filepath"]).convert("RGB")
-    max_width = 1000
-    scale = min(max_width / raw.width, 1.0)
-    disp_w, disp_h = int(raw.width * scale), int(raw.height * scale)
-    display_img = raw.resize((disp_w, disp_h))
-
-    initial_rects = {
-        "version": "4.4.0",
-        "objects": [
-            {
-                "type": "rect", "left": 0, "top": rc["top"] * scale,
-                "width": disp_w, "height": (rc["bottom"] - rc["top"]) * scale,
-                "fill": "rgba(200,45,35,0.12)", "stroke": "#c82d23", "strokeWidth": 2,
-            }
-            for rc in entry["row_coords"]
-        ],
-    }
-
-    canvas_result = st_canvas(
-        fill_color="rgba(255,204,0,0.25)", stroke_width=2, stroke_color="#ffcc00",
-        background_image=display_img, height=disp_h, width=disp_w,
-        drawing_mode="rect", initial_drawing=initial_rects, key=f"canvas_{entry['file']}",
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("💾 Save these rows", type="primary"):
-            if canvas_result.json_data is not None:
-                new_rows = []
-                for obj in canvas_result.json_data["objects"]:
-                    top = int(obj["top"] / scale)
-                    bottom = int((obj["top"] + obj["height"] * obj.get("scaleY", 1)) / scale)
-                    if bottom > top:
-                        new_rows.append({"top": top, "bottom": bottom})
-                new_rows.sort(key=lambda r: r["top"])
-                entry["row_coords"] = [
-                    {"row": i + 1, "top": r["top"], "bottom": r["bottom"], "flagged": False}
-                    for i, r in enumerate(new_rows)
-                ]
-                entry["total_rows"] = len(entry["row_coords"])
-                entry["highlighted"] = []
-                st.session_state["editing_entry_idx"] = None
-                st.rerun()
-    with col2:
-        if st.button("◀ Cancel"):
-            st.session_state["editing_entry_idx"] = None
-            st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════
