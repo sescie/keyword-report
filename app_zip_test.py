@@ -186,16 +186,26 @@ def render_review_step():
         render_crop_editor(manifest["entries"][st.session_state["editing_entry_idx"]])
         return
 
-    filter_col1, filter_col2 = st.columns(2)
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
     keywords = sorted({e["keyword"] for e in manifest["entries"]})
+    weeks = sorted({e["week_num"] for e in manifest["entries"]})
+    pages = sorted({e["page"] for e in manifest["entries"]})
     with filter_col1:
-        kw_filter = st.selectbox("Filter by keyword", ["All"] + keywords)
+        kw_filter = st.selectbox("Keyword", ["All"] + keywords)
     with filter_col2:
+        week_filter = st.selectbox("Week", ["All"] + [f"Week {w}" for w in weeks])
+    with filter_col3:
+        page_filter = st.selectbox("Page", ["All"] + [f"Page {p}" for p in pages])
+    with filter_col4:
         show_filter = st.selectbox("Show", ["All screenshots", "Only flagged", "Only unflagged"])
 
     for idx, entry in enumerate(manifest["entries"]):
         _ensure_flagged_field(entry)
         if kw_filter != "All" and entry["keyword"] != kw_filter:
+            continue
+        if week_filter != "All" and f"Week {entry['week_num']}" != week_filter:
+            continue
+        if page_filter != "All" and f"Page {entry['page']}" != page_filter:
             continue
         has_flagged = len(entry["highlighted"]) > 0
         if show_filter == "Only flagged" and not has_flagged:
