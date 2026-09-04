@@ -709,7 +709,18 @@ def process_explorer_image(image_path, out_dir, page: int | None = None,
     label_font = load_font(17)
     size_part1 = (total + 1) // 2
     part_sizes = [size_part1, total - size_part1]
-    stem = image_path.stem
+    # Includes the parent (day) folder name, NOT just the screenshot's
+    # own filename — two different days can genuinely have a
+    # screenshot with the identical filename (confirmed on real data:
+    # both day 7 and day 14 had a file literally named "Ashley Rocharam
+    # pg 4 no 4,6.jpeg"). Using only the filename here meant their
+    # output images collided on the exact same path, so whichever entry
+    # got processed last silently overwrote the other's image file on
+    # disk — every slide's metadata text stayed correct (that's set
+    # independently per slide), but multiple slides ended up displaying
+    # the SAME shared image, whatever the last-written one happened to
+    # contain, regardless of that slide's own actual data.
+    stem = f"{image_path.parent.name}_{image_path.stem}"
     outputs = []
     highlighted = []
     row_coords_out = []
@@ -880,7 +891,6 @@ def is_marked(filename_no_ext: str) -> bool:
 
 
 ROW_ORDER = [
-    "Google/Explorer",
     "A. Prashin Sudesh Premchand Rocharam",
     "B. Prashin Premchand Rocharam",
     "C. Sudesh Premchand Rocharam",
@@ -1488,6 +1498,18 @@ def scan_and_detect(drive_root, year, month_name, month_num, template_path=None)
             set_progress(done, max(len(jobs), 1))
 
     log("\nDetection complete.")
+
+    # Sorted here explicitly, deliberately — jobs run in PARALLEL across
+    # several worker threads for speed, and as_completed() returns each
+    # one in whatever order it happens to actually FINISH, not the order
+    # it was submitted in. Appending straight from that loop means the
+    # review screen's own display order becomes a race condition: which
+    # screenshot's OCR happened to finish first, not calendar order —
+    # confirmed this is exactly why a later week could appear before an
+    # earlier one. Restoring week -> day -> keyword -> page order here
+    # makes the review screen's order deterministic regardless of
+    # which thread happened to finish first.
+    manifest_entries.sort(key=lambda e: (e["week_num"], e["day_num"], e["keyword"], e["page"]))
 
     log("\n" + "=" * 70)
     log("POWERPOINT TEMPLATE")
