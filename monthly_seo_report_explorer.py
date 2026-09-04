@@ -1068,20 +1068,74 @@ def replace_picture(slide, image_path, slide_width):
     slide.shapes.add_picture(image_path, left, top, width=width, height=height)
 
 
+def _slide_title_text(slide) -> str:
+    for shp in slide.shapes:
+        if shp.name.startswith("Title") and shp.has_text_frame:
+            return shp.text_frame.text.strip()
+    return ""
+
+
+def _slide_has_picture(slide) -> bool:
+    return any(shp.shape_type == 13 for shp in slide.shapes)
+
+
+def classify_template_slides(prs) -> dict:
+    """
+    Identifies each role slide (title / divider / result / conclusion)
+    by its ACTUAL CONTENT, not a fixed position — a hardcoded index
+    only works if every template happens to lay slides out in exactly
+    that order, which real templates don't reliably do (confirmed on a
+    real client template: the divider slide sat at index 1, but the
+    code assumed index 2, which was actually that template's first
+    *result* example — so every built divider silently used the wrong
+    slide's design and content). A slide's role is unambiguous from
+    what's actually on it: the divider's title says "WEEK ... SEARCH
+    RESULTS", the conclusion's says "CONCLUSION", and the first
+    remaining slide with both a title placeholder and a picture is the
+    result-layout example. Falls back to the old fixed positions only
+    if a role genuinely can't be found by content, so an unusual
+    template still produces SOMETHING rather than crashing outright.
+    """
+    idx_title = idx_divider = idx_result = idx_conclusion = None
+    for i, slide in enumerate(prs.slides):
+        title_text = _slide_title_text(slide).upper()
+        if idx_divider is None and "WEEK" in title_text and "SEARCH RESULTS" in title_text:
+            idx_divider = i
+        elif idx_conclusion is None and title_text.strip() == "CONCLUSION":
+            idx_conclusion = i
+        elif idx_title is None and title_text.strip() == "SEO REPORT":
+            idx_title = i
+        elif idx_result is None and _slide_has_picture(slide) and i not in (idx_title, idx_divider):
+            idx_result = i
+
+    n = len(prs.slides._sldIdLst)
+    if idx_title is None:
+        idx_title = IDX_TITLE
+    if idx_divider is None:
+        idx_divider = IDX_DIVIDER
+        log(f"  ⚠  Couldn't find a 'WEEK ... SEARCH RESULTS' slide by content in the "
+            f"template — falling back to slide index {IDX_DIVIDER}. Week dividers may not "
+            f"match your template's real design.")
+    if idx_result is None:
+        idx_result = IDX_RESULT
+    if idx_conclusion is None:
+        idx_conclusion = n - 1
+        log(f"  ⚠  Couldn't find a 'CONCLUSION' slide by content in the template — "
+            f"using the last slide (index {idx_conclusion}) instead.")
+
+    return {"title": idx_title, "divider": idx_divider, "result": idx_result, "conclusion": idx_conclusion}
+
+
 def build_pptx(template_path, out_path, month_name, year, week_groups, summary_text):
     prs = Presentation(template_path)
     n_original = len(prs.slides._sldIdLst)
     slide_w = prs.slide_width
 
-    # The conclusion slide is the LAST slide of the ORIGINAL template,
-    # not a fixed index — a hardcoded "100" assumed every template has
-    # at least 101 slides, which crashed immediately on any normal,
-    # reasonably-sized upload (confirmed: this raised exactly the
-    # reported IndexError on a real template). A template only needs to
-    # actually have a title, a week-divider, a result layout, and a
-    # final conclusion slide — order matters, exact slide COUNT doesn't.
-    idx_conclusion = n_original - 1
-    min_needed = IDX_RESULT + 2  # room for a conclusion slide after the result layout
+    roles = classify_template_slides(prs)
+    idx_title, idx_divider, idx_result, idx_conclusion = (
+        roles["title"], roles["divider"], roles["result"], roles["conclusion"])
+
+    min_needed = max(idx_title, idx_divider, idx_result, idx_conclusion) + 1
     if n_original < min_needed:
         raise ValueError(
             f"This template has only {n_original} slide(s), but at least {min_needed} are "
@@ -1089,7 +1143,7 @@ def build_pptx(template_path, out_path, month_name, year, week_groups, summary_t
             f"final conclusion slide, in that order. Please use a template with more slides."
         )
 
-    title_slide = duplicate_slide(prs, IDX_TITLE)
+    title_slide = duplicate_slide(prs, idx_title)
     set_title_text(title_slide, "SEO REPORT")
     for shp in title_slide.shapes:
         if shp.name.startswith("Subtitle") and shp.has_text_frame:
@@ -1099,11 +1153,11 @@ def build_pptx(template_path, out_path, month_name, year, week_groups, summary_t
         entries = week_groups[week_num]
         if not entries:
             continue
-        week_divider = duplicate_slide(prs, IDX_DIVIDER)
+        week_divider = duplicate_slide(prs, idx_divider)
         set_title_text(week_divider, f"WEEK {week_num} SEARCH RESULTS")
 
         for entry in entries:
-            rs = duplicate_slide(prs, IDX_RESULT)
+            rs = duplicate_slide(prs, idx_result)
             replace_picture(rs, entry["path"], slide_w)
             page_item = entry["pgno"] or f"Results {entry.get('r_start', '')}–{entry.get('r_end', '')}"
             set_metadata_text(rs, [
