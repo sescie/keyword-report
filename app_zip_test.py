@@ -227,35 +227,6 @@ def render_review_step():
                 with c3:
                     st.image(_row_thumb(entry, rc), width="stretch")
 
-            with st.expander("➕ Add a row this missed (enter pixel positions)"):
-                raw_h = Image.open(entry["raw_filepath"]).height
-                c1, c2, c3 = st.columns([1, 1, 1])
-                with c1:
-                    new_top = st.number_input("Top", min_value=0, max_value=raw_h, value=0,
-                                               key=f"newtop_{idx}")
-                with c2:
-                    new_bottom = st.number_input("Bottom", min_value=0, max_value=raw_h,
-                                                  value=min(200, raw_h), key=f"newbot_{idx}")
-                with c3:
-                    st.write("")
-                    st.write("")
-                    if st.button("Add row", key=f"addrow_{idx}"):
-                        if new_bottom > new_top:
-                            new_num = (max((r["row"] for r in entry["row_coords"]), default=0)) + 1
-                            entry["row_coords"].append(
-                                {"row": new_num, "top": int(new_top), "bottom": int(new_bottom), "flagged": False})
-                            _renumber(entry)
-                            _commit(entry)
-                            st.rerun()
-                        else:
-                            st.error("Bottom must be greater than top.")
-                # a live preview of what this range currently looks like,
-                # so picking the right numbers doesn't require guessing blind
-                if new_bottom > new_top:
-                    raw = Image.open(entry["raw_filepath"]).convert("RGB")
-                    preview = raw.crop((0, int(new_top), entry["x_right"], int(new_bottom)))
-                    st.image(preview, caption="Preview of this range", width="stretch")
-
     st.divider()
     if st.button("🚀 Build Report", type="primary"):
         # A fresh build must run EVERY time this is clicked, including
