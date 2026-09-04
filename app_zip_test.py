@@ -245,6 +245,17 @@ def render_review_step():
 
     st.divider()
     if st.button("🚀 Build Report", type="primary"):
+        # A fresh build must run EVERY time this is clicked, including
+        # a second/third time after going back to fix something — the
+        # old "only build once per session" check silently kept
+        # re-showing the FIRST build's results even after real edits
+        # (verified directly: deleting a flagged row updated the
+        # manifest correctly, but the previously-cached build summary
+        # still reported the old, pre-edit flagged count). Clearing
+        # these here guarantees build_report_from_manifest actually
+        # runs again against whatever the manifest looks like right now.
+        st.session_state.pop("build_done", None)
+        st.session_state.pop("build_summary", None)
         st.session_state["step"] = "build"
         st.rerun()
 
@@ -343,10 +354,20 @@ def render_build_step():
     st.download_button("⬇️ Download full report (ZIP)", data=zip_buf,
                         file_name="report.zip", mime="application/zip", type="primary")
 
-    if st.button("Start a new report"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("◀ Back to review (fix something else)"):
+            # Going back doesn't need to clear build_done itself — the
+            # "Build Report" button already clears it on the way back
+            # IN, so whatever gets edited here is guaranteed to produce
+            # a fresh build next time, not a stale re-show of this one.
+            st.session_state["step"] = "review"
+            st.rerun()
+    with col2:
+        if st.button("Start a new report"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════
