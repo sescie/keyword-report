@@ -28,12 +28,31 @@ from PIL import Image
 import monthly_seo_report_google as google_core
 import monthly_seo_report_explorer as explorer_core
 
+# Streamlit Cloud's actual allocated memory is much smaller than what
+# os.cpu_count() reports from the underlying host — the core scripts'
+# own default (up to 8 parallel OCR/decode workers) assumes a
+# reasonably resourced desktop machine. Running that many full
+# screenshots decoded in memory AT ONCE is exactly the kind of thing
+# that exhausts a constrained container's memory during a big batch.
+# Capped lower here specifically for the web app; the desktop script's
+# own default is untouched for people running it locally with more
+# headroom to spare.
+google_core.IMAGE_WORKERS = 2
+explorer_core.IMAGE_WORKERS = 2
+
 MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 ]
 
+# Bump this string every time these files are handed over — shown at the
+# bottom of the sidebar so it's possible to tell AT A GLANCE, just by
+# looking at the running app, whether it's actually running the latest
+# code or an older cached/undeployed version. No more guessing.
+APP_BUILD = "2026-09-04-1"
+
 st.set_page_config(page_title="SEO Report Builder — ZIP test", layout="wide", page_icon="🧪")
+st.sidebar.caption(f"Build: {APP_BUILD}")
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -153,8 +172,23 @@ def _ensure_flagged_field(entry):
         rc.setdefault("flagged", rc["row"] in flagged_nums)
 
 
+@st.cache_data(max_entries=8, show_spinner=False)
+def _load_raw_image(raw_filepath: str):
+    """Decoding a raw screenshot is the single most expensive step in
+    the whole review screen — and _row_thumb was calling this fresh for
+    EVERY row of a screenshot, so a 12-row screenshot decoded the exact
+    same file 12 separate times (measured: 338 MB for one screenshot
+    alone, just from this redundancy). Caching by file path means it's
+    decoded once and reused for every row's thumbnail AND across
+    reruns (every checkbox click reruns the whole script). Capped at 8
+    entries so the cache itself can't grow unbounded across a batch of
+    hundreds of screenshots — only the few currently in view stay
+    cached, not everything ever opened this session."""
+    return Image.open(raw_filepath).convert("RGB")
+
+
 def _row_thumb(entry, rc, max_width=780):
-    raw = Image.open(entry["raw_filepath"]).convert("RGB")
+    raw = _load_raw_image(entry["raw_filepath"])
     crop = raw.crop((0, rc["top"], entry["x_right"], rc["bottom"]))
     if crop.width > max_width:
         scale = max_width / crop.width
