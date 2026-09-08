@@ -128,28 +128,6 @@ MAX_RESULTS_PER_SHOT = 60
 ROW_GAP_BAND = 6
 ROW_GAP_SEARCH = 0.4
 
-FLAGGED_KEYWORDS = [
-    "court", "courts", "lawsuit", "trial", "judge", "verdict", "conviction",
-    "convicted", "sentenced", "sentencing", "plea", "guilty", "acquitted",
-    "subpoena", "hearing", "defendant", "plaintiff", "litigation", "docket",
-    "indicted", "indictment", "charged", "charges", "arraignment", "bail",
-    "parole", "probation", "warrant", "injunction", "restraining order",
-    "supreme court", "district court", "federal court", "appeals court",
-    "money laundering", "laundering", "wire fraud", "embezzlement",
-    "financial crime", "illicit funds", "shell company", "tax evasion",
-    "proceeds of crime", "structuring", "smurfing",
-    "fraud", "scam", "theft", "robbery", "burglary", "murder", "homicide",
-    "assault", "battery", "drug", "narcotics", "trafficking", "smuggling",
-    "extortion", "bribery", "corruption", "forgery", "counterfeit",
-    "illegal", "criminal", "felony", "misdemeanor", "arrested", "arrest",
-    "prison", "jail", "incarcerated", "fugitive", "suspect", "accused",
-    "crime", "offense", "violation", "racket", "racketeering", "cartel",
-    "gang", "syndicate", "ponzi", "insider trading", "securities fraud",
-    "identity theft", "cybercrime", "hacking", "blackmail",
-    "transnet",
-]
-
-
 def load_font(size: int) -> ImageFont.FreeTypeFont:
     for path in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -232,22 +210,6 @@ def extract_flagged_rows_from_filename(stem: str) -> list[int] | None:
     return sorted(rows) if rows else None
 
 
-def row_is_flagged(ocr_text: str) -> bool:
-    text_lower = ocr_text.lower()
-    return any(kw in text_lower for kw in FLAGGED_KEYWORDS)
-
-
-def ocr_row(img: Image.Image, y0: int, y1: int, x_right: int | None = None) -> str:
-    crop = img.crop((160, y0, x_right or img.width, y1))
-    gray = crop.convert("L")
-    enhanced = ImageEnhance.Contrast(gray).enhance(OCR_CONTRAST)
-    sharpened = enhanced.filter(ImageFilter.SHARPEN)
-    big = sharpened.resize(
-        (sharpened.width * OCR_SCALE, sharpened.height * OCR_SCALE), Image.LANCZOS
-    )
-    return pytesseract.image_to_string(big, config="--psm 6 --oem 3")
-
-
 RESULT_RANGE_PATTERN = re.compile(
     r'(\d[\d,]*)\s*[-–—]\s*(\d[\d,]*)\s+[o0]f\s+[\d,]+', re.IGNORECASE
 )
@@ -260,7 +222,19 @@ def detect_page_info(img: Image.Image, page_hint: int | None = None,
     scan_to = min(250, int(H * 0.20))
     crop = img.crop((80, 60, 700, scan_to + 40))
     big = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
-    text = pytesseract.image_to_string(big, config="--psm 6")
+    try:
+        text = pytesseract.image_to_string(big, config="--psm 6")
+    except Exception as exc:
+        # Tesseract is treated as OPTIONAL, not required — the filename
+        # itself already carries the page number reliably (extract_
+        # page_hint, "pg N"), so if the OCR binary genuinely isn't
+        # installed (or fails for any other reason), reading the header
+        # text is skipped entirely rather than crashing. This is what
+        # lets the app deploy and run correctly even without packages.txt
+        # ever needing to succeed at installing Tesseract via apt.
+        log(f"  ℹ  OCR unavailable ({exc.__class__.__name__}) — using the filename's own "
+            f"page number instead of reading it from the screenshot.")
+        text = ""
 
     for m in RESULT_RANGE_PATTERN.finditer(text):
         try:
@@ -573,29 +547,6 @@ def apply_highlight(canvas: Image.Image, x0: int, y0: int, x1: int, y1: int) -> 
 # ════════════════════════════════════════════════════════════════════════
 # Detection-only pass (review-before-build) + full build
 # ════════════════════════════════════════════════════════════════════════
-
-def compute_auto_flagged(img: Image.Image, boundaries: list[int], x_right: int, total: int) -> set[int]:
-    auto_flagged = set()
-    for i in range(total):
-        text = ocr_row(img, boundaries[i], boundaries[i + 1], x_right)
-        if row_is_flagged(text):
-            auto_flagged.add(i + 1)
-    return auto_flagged
-
-
-def compute_auto_flagged_from_spans(img: Image.Image, row_spans: list[tuple[int, int]], x_right: int) -> set[int]:
-    """Same as compute_auto_flagged, but takes each row's own (top,
-    bottom) span directly rather than a shared boundaries list — used
-    on the precomputed_rows path, where rows may no longer be
-    contiguous (a deleted row leaves a gap), so there's no valid single
-    boundaries list to index into in the first place."""
-    auto_flagged = set()
-    for i, (top, bot) in enumerate(row_spans):
-        text = ocr_row(img, top, bot, x_right)
-        if row_is_flagged(text):
-            auto_flagged.add(i + 1)
-    return auto_flagged
-
 
 def detect_rows_for_review(image_path, page_hint: int | None = None) -> dict:
     image_path = Path(image_path)
