@@ -230,6 +230,31 @@ def _row_thumb(entry, rc, max_width=780):
     return crop
 
 
+def _match_flags_by_overlap(old_rows, new_rows):
+    """For each redrawn/new row, finds whichever OLD row it overlaps
+    with most (as a fraction of the NEW row's own height) and inherits
+    THAT row's flagged state if the overlap is substantial (>50%) —
+    otherwise defaults to unflagged. This is what lets someone redraw
+    ONE row's boundary, or add a row that was missed, without wiping
+    out the flags on every OTHER row that didn't move at all."""
+    result = []
+    for new_top, new_bottom in new_rows:
+        new_height = max(1, new_bottom - new_top)
+        best_overlap_ratio = 0.0
+        best_flag = False
+        for old in old_rows:
+            overlap = max(0, min(new_bottom, old["bottom"]) - max(new_top, old["top"]))
+            ratio = overlap / new_height
+            if ratio > best_overlap_ratio:
+                best_overlap_ratio = ratio
+                best_flag = old["flagged"]
+        result.append({
+            "top": new_top, "bottom": new_bottom,
+            "flagged": best_flag if best_overlap_ratio > 0.5 else False,
+        })
+    return result
+
+
 def render_review_step():
     manifest = st.session_state["manifest"]
     st.title("Review")
@@ -243,10 +268,6 @@ def render_review_step():
     st.caption("Flags shown here were parsed straight from each filename's `no …` list — "
                "correct anything that needs it below before building.")
     st.divider()
-
-    if st.session_state["editing_entry_idx"] is not None:
-        render_crop_editor(manifest["entries"][st.session_state["editing_entry_idx"]])
-        return
 
     filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
     keywords = sorted({e["keyword"] for e in manifest["entries"]})
@@ -282,26 +303,7 @@ def render_review_step():
             f"{entry['date']} · {entry['file']} — {len(entry['row_coords'])} row(s), {flagged_n} flagged",
             expanded=False, key=f"expander_{idx}",
         ):
-            if st.button("✏️ Edit rows visually (drag to redraw or add)", key=f"editbtn_{idx}"):
-                st.session_state["editing_entry_idx"] = idx
-                st.rerun()
-
-            for rc in sorted(entry["row_coords"], key=lambda r: r["top"]):
-                c1, c2, c3 = st.columns([0.14, 0.1, 0.76])
-                with c1:
-                    new_val = st.checkbox(f"🚩 Flag #{rc['row']}", value=rc["flagged"],
-                                           key=f"flag_{idx}_{rc['row']}_{id(rc)}")
-                    if new_val != rc["flagged"]:
-                        rc["flagged"] = new_val
-                        _commit(entry)
-                with c2:
-                    if st.button("✕ Delete", key=f"del_{idx}_{rc['row']}_{id(rc)}"):
-                        entry["row_coords"] = [r for r in entry["row_coords"] if r is not rc]
-                        _renumber(entry)
-                        _commit(entry)
-                        st.rerun()
-                with c3:
-                    st.image(_row_thumb(entry, rc), width="stretch")
+            render_entry_panel(idx, entry)
 
     st.divider()
     if st.button("🚀 Build Report", type="primary"):
@@ -320,75 +322,54 @@ def render_review_step():
         st.rerun()
 
 
-def _match_flags_by_overlap(old_rows, new_rows):
-    """For each redrawn/new row, finds whichever OLD row it overlaps
-    with most (as a fraction of the NEW row's own height) and inherits
-    THAT row's flagged state if the overlap is substantial (>50%) —
-    otherwise defaults to unflagged. This is what lets someone redraw
-    ONE row's boundary, or add a row that was missed, without wiping
-    out the flags on every OTHER row that didn't move at all — the old
-    version reset every flag to unflagged on every save, regardless of
-    how small the actual edit was."""
-    result = []
-    for new_top, new_bottom in new_rows:
-        new_height = max(1, new_bottom - new_top)
-        best_overlap_ratio = 0.0
-        best_flag = False
-        for old in old_rows:
-            overlap = max(0, min(new_bottom, old["bottom"]) - max(new_top, old["top"]))
-            ratio = overlap / new_height
-            if ratio > best_overlap_ratio:
-                best_overlap_ratio = ratio
-                best_flag = old["flagged"]
-        result.append({
-            "top": new_top, "bottom": new_bottom,
-            "flagged": best_flag if best_overlap_ratio > 0.5 else False,
-        })
-    return result
+def render_entry_panel(idx, entry):
+    """Everything for one screenshot in a single place: a draggable
+    canvas to redraw a row's boundary or add one that was missed, and
+    the flag/delete list right below it — no separate 'edit visually'
+    page to click into and back out of. Rows untouched by a canvas
+    save keep their current flag; only a row that's genuinely redrawn
+    or newly added gets freshly evaluated."""
+    if HAS_CANVAS:
+        st.caption("Drag directly on the screenshot below to redraw a row's boundary, or draw "
+                   "in empty space to add a row detection missed. Existing rows show in red "
+                   "(flagged) or blue (unflagged) — save to apply, or just use the flag/delete "
+                   "list below without touching the drawing at all.")
+        raw = _load_raw_image(entry["raw_filepath"])
+        max_width = 1000
+        scale = min(max_width / raw.width, 1.0)
+        disp_w, disp_h = int(raw.width * scale), int(raw.height * scale)
+        display_img = raw.resize((disp_w, disp_h))
 
+        initial_rects = {
+            "version": "4.4.0",
+            "objects": [
+                {
+                    "type": "rect", "left": 0, "top": rc["top"] * scale,
+                    "width": disp_w, "height": (rc["bottom"] - rc["top"]) * scale,
+                    "fill": "rgba(200,45,35,0.15)" if rc["flagged"] else "rgba(79,157,255,0.12)",
+                    "stroke": "#c82d23" if rc["flagged"] else "#4f9dff", "strokeWidth": 2,
+                }
+                for rc in entry["row_coords"]
+            ],
+        }
 
-def render_crop_editor(entry):
-    st.subheader(f"Visual editor — {entry['file']}")
-    st.caption("Drag a rectangle over an existing row to redraw its boundary. Drag in empty "
-               "space to add a row detection missed. Rows you don't touch keep their current "
-               "flag — only a row that's genuinely redrawn or added may lose its flag.")
+        # Key includes row count AND flagged count, not just the
+        # filename — a fixed key lets the component keep its OWN stale
+        # frontend state even after row_coords changes underneath it
+        # (e.g. from the Delete button just below), so the canvas would
+        # keep showing boxes that no longer match reality. Including
+        # both counts forces a fresh re-mount (and a fresh read of
+        # initial_drawing) after any edit from either control.
+        flagged_n = sum(1 for r in entry["row_coords"] if r["flagged"])
+        canvas_key = f"canvas_{idx}_{len(entry['row_coords'])}_{flagged_n}"
 
-    if not HAS_CANVAS:
-        st.warning("Visual dragging isn't available right now — you can still flag/delete "
-                   "rows on the main review screen.")
-        if st.button("◀ Back to review"):
-            st.session_state["editing_entry_idx"] = None
-            st.rerun()
-        return
+        canvas_result = st_canvas(
+            fill_color="rgba(255,204,0,0.25)", stroke_width=2, stroke_color="#ffcc00",
+            background_image=display_img, height=disp_h, width=disp_w,
+            drawing_mode="rect", initial_drawing=initial_rects, key=canvas_key,
+        )
 
-    raw = _load_raw_image(entry["raw_filepath"])
-    max_width = 1000
-    scale = min(max_width / raw.width, 1.0)
-    disp_w, disp_h = int(raw.width * scale), int(raw.height * scale)
-    display_img = raw.resize((disp_w, disp_h))
-
-    initial_rects = {
-        "version": "4.4.0",
-        "objects": [
-            {
-                "type": "rect", "left": 0, "top": rc["top"] * scale,
-                "width": disp_w, "height": (rc["bottom"] - rc["top"]) * scale,
-                "fill": "rgba(200,45,35,0.15)" if rc["flagged"] else "rgba(79,157,255,0.12)",
-                "stroke": "#c82d23" if rc["flagged"] else "#4f9dff", "strokeWidth": 2,
-            }
-            for rc in entry["row_coords"]
-        ],
-    }
-
-    canvas_result = st_canvas(
-        fill_color="rgba(255,204,0,0.25)", stroke_width=2, stroke_color="#ffcc00",
-        background_image=display_img, height=disp_h, width=disp_w,
-        drawing_mode="rect", initial_drawing=initial_rects, key=f"canvas_{entry['file']}",
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("💾 Save these rows", type="primary"):
+        if st.button("💾 Save row positions", key=f"savecanvas_{idx}", type="primary"):
             if canvas_result.json_data is not None:
                 new_rows_raw = []
                 for obj in canvas_result.json_data["objects"]:
@@ -404,13 +385,27 @@ def render_crop_editor(entry):
                 ]
                 entry["total_rows"] = len(entry["row_coords"])
                 entry["highlighted"] = sorted(rc["row"] for rc in entry["row_coords"] if rc["flagged"])
-                st.session_state["editing_entry_idx"] = None
                 st.rerun()
-    with col2:
-        if st.button("◀ Cancel"):
-            st.session_state["editing_entry_idx"] = None
-            st.rerun()
+        st.divider()
+    else:
+        st.info("Visual dragging isn't available right now — flag/delete rows below instead.")
 
+    for rc in sorted(entry["row_coords"], key=lambda r: r["top"]):
+        c1, c2, c3 = st.columns([0.14, 0.1, 0.76])
+        with c1:
+            new_val = st.checkbox(f"🚩 Flag #{rc['row']}", value=rc["flagged"],
+                                   key=f"flag_{idx}_{rc['row']}_{id(rc)}")
+            if new_val != rc["flagged"]:
+                rc["flagged"] = new_val
+                _commit(entry)
+        with c2:
+            if st.button("✕ Delete", key=f"del_{idx}_{rc['row']}_{id(rc)}"):
+                entry["row_coords"] = [r for r in entry["row_coords"] if r is not rc]
+                _renumber(entry)
+                _commit(entry)
+                st.rerun()
+        with c3:
+            st.image(_row_thumb(entry, rc), width="stretch")
 
 # ════════════════════════════════════════════════════════════════════════
 # Step 3: Build + download
