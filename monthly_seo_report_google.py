@@ -629,8 +629,15 @@ def process_google_image(image_path, out_dir, page: int | None = None,
     name = extract_name(image_path.stem)
     badge_font = load_font(20)
     label_font = load_font(17)
-    size_part1 = (total + 1) // 2
-    part_sizes = [size_part1, total - size_part1]
+    # Fewer than 7 rows fits comfortably on one slide — splitting into
+    # "Part 1 of 2" for, say, 4 rows just adds a pointless extra slide
+    # with almost nothing on it. Only split once there's genuinely too
+    # much to fit reasonably on a single slide.
+    if total < 7:
+        part_sizes = [total]
+    else:
+        size_part1 = (total + 1) // 2
+        part_sizes = [size_part1, total - size_part1]
     # Includes the parent (day) folder name, NOT just the screenshot's
     # own filename — two different days can genuinely have a
     # screenshot with the identical filename. Using only the filename
