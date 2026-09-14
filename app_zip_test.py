@@ -77,7 +77,7 @@ MONTH_NAMES = [
 # bottom of the sidebar so it's possible to tell AT A GLANCE, just by
 # looking at the running app, whether it's actually running the latest
 # code or an older cached/undeployed version. No more guessing.
-APP_BUILD = "2026-09-14-crop-editor"
+APP_BUILD = "2026-09-14-unified-2"
 
 st.set_page_config(page_title="SEO Report Builder — ZIP test", layout="wide", page_icon="🧪")
 st.sidebar.caption(f"Build: {APP_BUILD}")
@@ -353,15 +353,25 @@ def render_entry_panel(idx, entry):
             ],
         }
 
-        # Key includes row count AND flagged count, not just the
-        # filename — a fixed key lets the component keep its OWN stale
-        # frontend state even after row_coords changes underneath it
-        # (e.g. from the Delete button just below), so the canvas would
-        # keep showing boxes that no longer match reality. Including
-        # both counts forces a fresh re-mount (and a fresh read of
-        # initial_drawing) after any edit from either control.
-        flagged_n = sum(1 for r in entry["row_coords"] if r["flagged"])
-        canvas_key = f"canvas_{idx}_{len(entry['row_coords'])}_{flagged_n}"
+        # Key is a STABLE identifier for this screenshot's canvas —
+        # it does NOT change when a checkbox or delete button below is
+        # clicked. An earlier version tied this key to the row/flag
+        # count specifically so the canvas would "stay in sync" with
+        # the list below it — but that meant ANY unrelated click (a
+        # checkbox, a delete button) destroyed and rebuilt the canvas
+        # component from scratch, silently discarding whatever the
+        # person was mid-way through drawing, before they ever got a
+        # chance to click Save. A stable key means the canvas keeps
+        # whatever's currently drawn on it no matter what else gets
+        # clicked nearby; explicit "Refresh drawing" below is the only
+        # thing that intentionally re-reads row_coords from scratch.
+        canvas_key = f"canvas_{idx}_{entry['file']}"
+
+        refresh_col, _ = st.columns([1, 3])
+        with refresh_col:
+            if st.button("🔄 Refresh drawing to match list below", key=f"refresh_{idx}"):
+                st.session_state.pop(canvas_key, None)
+                st.rerun()
 
         canvas_result = st_canvas(
             fill_color="rgba(255,204,0,0.25)", stroke_width=2, stroke_color="#ffcc00",
