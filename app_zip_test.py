@@ -18,6 +18,7 @@ Run locally with:
 """
 
 import io
+import datetime
 import os
 import tempfile
 import zipfile
@@ -27,6 +28,33 @@ from PIL import Image
 
 import monthly_seo_report_google as google_core
 import monthly_seo_report_explorer as explorer_core
+
+try:
+    # Newer Streamlit relocated image_to_url from streamlit.elements.image
+    # to streamlit.elements.lib.image_utils, and changed its signature
+    # (a plain pixel-width int became a LayoutConfig object) — but
+    # streamlit-drawable-canvas (last released for the OLD location and
+    # signature) still calls the old one directly, and crashes as soon
+    # as a background image is actually used. This shim re-attaches a
+    # compatible image_to_url back onto streamlit.elements.image before
+    # the canvas library ever gets a chance to look for it — verified
+    # directly this is genuinely what the canvas library calls, and
+    # that this bridges the old calling convention to the new one
+    # without raising.
+    import streamlit.elements.image as _st_image_compat
+    if not hasattr(_st_image_compat, "image_to_url"):
+        from streamlit.elements.lib.image_utils import image_to_url as _new_image_to_url
+        from streamlit.elements.lib.layout_utils import LayoutConfig as _LayoutConfig
+
+        def _compat_image_to_url(image, width, clamp, channels, output_format, image_id):
+            return _new_image_to_url(image, _LayoutConfig(width=width), clamp, channels, output_format, image_id)
+
+        _st_image_compat.image_to_url = _compat_image_to_url
+
+    from streamlit_drawable_canvas import st_canvas
+    HAS_CANVAS = True
+except ImportError:
+    HAS_CANVAS = False
 
 # Streamlit Cloud's actual allocated memory is much smaller than what
 # os.cpu_count() reports from the underlying host — the core scripts'
@@ -49,7 +77,7 @@ MONTH_NAMES = [
 # bottom of the sidebar so it's possible to tell AT A GLANCE, just by
 # looking at the running app, whether it's actually running the latest
 # code or an older cached/undeployed version. No more guessing.
-APP_BUILD = "2026-09-04-1"
+APP_BUILD = "2026-09-14-crop-editor"
 
 st.set_page_config(page_title="SEO Report Builder — ZIP test", layout="wide", page_icon="🧪")
 st.sidebar.caption(f"Build: {APP_BUILD}")
@@ -85,8 +113,14 @@ def render_upload_step():
     col1, col2 = st.columns(2)
     with col1:
         report_type = st.radio("Report type", ["Google", "Explorer"], horizontal=True)
-        year = st.text_input("Year", value="2026")
-        month_name = st.selectbox("Month", MONTH_NAMES, index=6)
+        # Defaults to the PREVIOUS calendar month, not a hardcoded
+        # "July 2026" — reports are always for a month that's already
+        # finished, so whatever "today" happens to be, last month is
+        # the sensible starting guess rather than a stale leftover.
+        _today = datetime.date.today()
+        _default_month_date = (_today.replace(day=1) - datetime.timedelta(days=1))
+        year = st.text_input("Year", value=str(_default_month_date.year))
+        month_name = st.selectbox("Month", MONTH_NAMES, index=_default_month_date.month - 1)
     with col2:
         st.markdown(
             f"**ZIP should contain the report-type folder directly**, e.g.:\n\n"
@@ -210,6 +244,10 @@ def render_review_step():
                "correct anything that needs it below before building.")
     st.divider()
 
+    if st.session_state["editing_entry_idx"] is not None:
+        render_crop_editor(manifest["entries"][st.session_state["editing_entry_idx"]])
+        return
+
     filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
     keywords = sorted({e["keyword"] for e in manifest["entries"]})
     weeks = sorted({e["week_num"] for e in manifest["entries"]})
@@ -244,6 +282,10 @@ def render_review_step():
             f"{entry['date']} · {entry['file']} — {len(entry['row_coords'])} row(s), {flagged_n} flagged",
             expanded=False, key=f"expander_{idx}",
         ):
+            if st.button("✏️ Edit rows visually (drag to redraw or add)", key=f"editbtn_{idx}"):
+                st.session_state["editing_entry_idx"] = idx
+                st.rerun()
+
             for rc in sorted(entry["row_coords"], key=lambda r: r["top"]):
                 c1, c2, c3 = st.columns([0.14, 0.1, 0.76])
                 with c1:
@@ -278,6 +320,98 @@ def render_review_step():
         st.rerun()
 
 
+def _match_flags_by_overlap(old_rows, new_rows):
+    """For each redrawn/new row, finds whichever OLD row it overlaps
+    with most (as a fraction of the NEW row's own height) and inherits
+    THAT row's flagged state if the overlap is substantial (>50%) —
+    otherwise defaults to unflagged. This is what lets someone redraw
+    ONE row's boundary, or add a row that was missed, without wiping
+    out the flags on every OTHER row that didn't move at all — the old
+    version reset every flag to unflagged on every save, regardless of
+    how small the actual edit was."""
+    result = []
+    for new_top, new_bottom in new_rows:
+        new_height = max(1, new_bottom - new_top)
+        best_overlap_ratio = 0.0
+        best_flag = False
+        for old in old_rows:
+            overlap = max(0, min(new_bottom, old["bottom"]) - max(new_top, old["top"]))
+            ratio = overlap / new_height
+            if ratio > best_overlap_ratio:
+                best_overlap_ratio = ratio
+                best_flag = old["flagged"]
+        result.append({
+            "top": new_top, "bottom": new_bottom,
+            "flagged": best_flag if best_overlap_ratio > 0.5 else False,
+        })
+    return result
+
+
+def render_crop_editor(entry):
+    st.subheader(f"Visual editor — {entry['file']}")
+    st.caption("Drag a rectangle over an existing row to redraw its boundary. Drag in empty "
+               "space to add a row detection missed. Rows you don't touch keep their current "
+               "flag — only a row that's genuinely redrawn or added may lose its flag.")
+
+    if not HAS_CANVAS:
+        st.warning("Visual dragging isn't available right now — you can still flag/delete "
+                   "rows on the main review screen.")
+        if st.button("◀ Back to review"):
+            st.session_state["editing_entry_idx"] = None
+            st.rerun()
+        return
+
+    raw = _load_raw_image(entry["raw_filepath"])
+    max_width = 1000
+    scale = min(max_width / raw.width, 1.0)
+    disp_w, disp_h = int(raw.width * scale), int(raw.height * scale)
+    display_img = raw.resize((disp_w, disp_h))
+
+    initial_rects = {
+        "version": "4.4.0",
+        "objects": [
+            {
+                "type": "rect", "left": 0, "top": rc["top"] * scale,
+                "width": disp_w, "height": (rc["bottom"] - rc["top"]) * scale,
+                "fill": "rgba(200,45,35,0.15)" if rc["flagged"] else "rgba(79,157,255,0.12)",
+                "stroke": "#c82d23" if rc["flagged"] else "#4f9dff", "strokeWidth": 2,
+            }
+            for rc in entry["row_coords"]
+        ],
+    }
+
+    canvas_result = st_canvas(
+        fill_color="rgba(255,204,0,0.25)", stroke_width=2, stroke_color="#ffcc00",
+        background_image=display_img, height=disp_h, width=disp_w,
+        drawing_mode="rect", initial_drawing=initial_rects, key=f"canvas_{entry['file']}",
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("💾 Save these rows", type="primary"):
+            if canvas_result.json_data is not None:
+                new_rows_raw = []
+                for obj in canvas_result.json_data["objects"]:
+                    top = int(obj["top"] / scale)
+                    bottom = int((obj["top"] + obj["height"] * obj.get("scaleY", 1)) / scale)
+                    if bottom > top:
+                        new_rows_raw.append((top, bottom))
+                new_rows_raw.sort(key=lambda r: r[0])
+                matched = _match_flags_by_overlap(entry["row_coords"], new_rows_raw)
+                entry["row_coords"] = [
+                    {"row": i + 1, "top": r["top"], "bottom": r["bottom"], "flagged": r["flagged"]}
+                    for i, r in enumerate(matched)
+                ]
+                entry["total_rows"] = len(entry["row_coords"])
+                entry["highlighted"] = sorted(rc["row"] for rc in entry["row_coords"] if rc["flagged"])
+                st.session_state["editing_entry_idx"] = None
+                st.rerun()
+    with col2:
+        if st.button("◀ Cancel"):
+            st.session_state["editing_entry_idx"] = None
+            st.rerun()
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Step 3: Build + download
 # ════════════════════════════════════════════════════════════════════════
@@ -307,8 +441,14 @@ def render_build_step():
                 zf.write(full, os.path.relpath(full, report_root))
     zip_buf.seek(0)
 
+    # Named after the report itself (type, month, year) rather than a
+    # generic "report.zip" — matters once you're juggling downloads
+    # from more than one month or more than one report type at a time.
+    report_type_label = "Google" if core is google_core else "Explorer"
+    zip_filename = f"{report_type_label}_SEO_Report_{manifest['month_name']}_{manifest['year']}.zip"
+
     st.download_button("⬇️ Download full report (ZIP)", data=zip_buf,
-                        file_name="report.zip", mime="application/zip", type="primary")
+                        file_name=zip_filename, mime="application/zip", type="primary")
 
     col1, col2 = st.columns(2)
     with col1:
