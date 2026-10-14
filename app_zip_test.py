@@ -53,7 +53,7 @@ MONTH_NAMES = [
 # bottom of the sidebar so it's possible to tell AT A GLANCE, just by
 # looking at the running app, whether it's actually running the latest
 # code or an older cached/undeployed version. No more guessing.
-APP_BUILD = "2026-10-13-full-page-read"
+APP_BUILD = "2026-10-14-no-add-row"
 
 st.set_page_config(page_title="SEO Report Builder — ZIP test", layout="wide", page_icon="🧪")
 st.sidebar.caption(f"Build: {APP_BUILD}")
@@ -489,41 +489,6 @@ def render_entry_panel(idx, entry):
                     (0, int(adj_top), entry["x_right"], int(adj_bottom)))
                 st.image(preview, caption="Preview at these positions", width="stretch")
 
-    st.divider()
-    with st.expander("➕ Add a row this missed (enter pixel positions)"):
-        raw_h = _load_raw_image(entry["raw_filepath"]).height
-        st.caption("Set both values below before clicking Add — the button won't do "
-                   "anything until you've picked a real range, so opening this section "
-                   "to look around can't accidentally add a stray row.")
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            new_top = st.number_input("Top", min_value=0, max_value=raw_h, value=0,
-                                       key=f"newtop_{idx}")
-        with c2:
-            # Defaults to the SAME value as "Top" (0), not a plausible-
-            # looking range — a default that already satisfies
-            # bottom > top would let the button fire on the very
-            # first click, before anyone has actually chosen real
-            # numbers (this silently added a junk row once before).
-            new_bottom = st.number_input("Bottom", min_value=0, max_value=raw_h, value=0,
-                                          key=f"newbot_{idx}")
-        with c3:
-            st.write("")
-            st.write("")
-            if st.button("Add row", key=f"addrow_{idx}"):
-                if new_bottom > new_top:
-                    new_num = (max((r["row"] for r in entry["row_coords"]), default=0)) + 1
-                    entry["row_coords"].append(
-                        {"row": new_num, "top": int(new_top), "bottom": int(new_bottom), "flagged": False})
-                    _renumber(entry)
-                    _commit(entry)
-                    st.rerun()
-                else:
-                    st.error("Set both Top and Bottom to a real range first (Bottom must be greater than Top).")
-        if new_bottom > new_top:
-            preview = _load_raw_image(entry["raw_filepath"]).crop(
-                (0, int(new_top), entry["x_right"], int(new_bottom)))
-            st.image(preview, caption="Preview of this range", width="stretch")
 
 # ════════════════════════════════════════════════════════════════════════
 # Step 3: Build + download
