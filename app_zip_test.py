@@ -21,6 +21,7 @@ import io
 import datetime
 import os
 import tempfile
+import traceback
 import zipfile
 
 import streamlit as st
@@ -29,6 +30,7 @@ from PIL import Image
 import monthly_seo_report_google as google_core
 import monthly_seo_report_explorer as explorer_core
 import review_session
+import review_ui
 
 CORES = {"Google": google_core, "Explorer": explorer_core}
 
@@ -53,7 +55,7 @@ MONTH_NAMES = [
 # bottom of the sidebar so it's possible to tell AT A GLANCE, just by
 # looking at the running app, whether it's actually running the latest
 # code or an older cached/undeployed version. No more guessing.
-APP_BUILD = "2026-10-14-no-add-row"
+APP_BUILD = "2026-10-14-fast-review"
 
 st.set_page_config(page_title="SEO Report Builder — ZIP test", layout="wide", page_icon="🧪")
 st.sidebar.caption(f"Build: {APP_BUILD}")
@@ -153,6 +155,7 @@ def _run_resume(resume_zip, resume_orig):
         st.session_state.pop(key, None)
     for idx in res["reviewed_indices"]:
         st.session_state[f"reviewed_{idx}"] = True
+        res["manifest"]["entries"][idx]["reviewed"] = True
     st.rerun()
 
 
@@ -179,6 +182,10 @@ def run_detection_core(report_type, year, month_name, zip_bytes, template_bytes=
 
     core = google_core if report_type == "Google" else explorer_core
     core.prompt_choice = lambda q, o: o[0]
+    if template_path:
+        # .potx / .ppsx etc. are converted to something python-pptx can open;
+        # anything that isn't a PowerPoint file fails HERE with a clear message
+        template_path = core.normalize_template(template_path)
 
     report_root, manifest, extra_csv_results = core.scan_and_detect(
         work_dir, year, month_name, month_num, template_path=template_path)
@@ -189,8 +196,16 @@ def run_detection_core(report_type, year, month_name, zip_bytes, template_bytes=
 def _run_detection(report_type, year, month_name, zip_file, template_file):
     template_bytes = template_file.getbuffer() if template_file is not None else None
     template_filename = template_file.name if template_file is not None else None
-    work_dir, report_root, manifest, core, template_path, extra_csv_results = run_detection_core(
-        report_type, year, month_name, zip_file.getbuffer(), template_bytes, template_filename)
+    try:
+        work_dir, report_root, manifest, core, template_path, extra_csv_results = run_detection_core(
+            report_type, year, month_name, zip_file.getbuffer(), template_bytes, template_filename)
+    except Exception as exc:
+        # Shown in full: an uncaught exception on Streamlit Cloud is redacted to
+        # "the original error message is redacted", which tells nobody anything.
+        st.error(f"Couldn't process the upload: {exc}")
+        with st.expander("Technical details"):
+            st.code(traceback.format_exc())
+        return
 
     if not manifest["entries"]:
         st.warning("No screenshots were found. Double-check the ZIP contains the "
@@ -209,53 +224,13 @@ def _run_detection(report_type, year, month_name, zip_file, template_file):
 # Step 2: Review
 # ════════════════════════════════════════════════════════════════════════
 
-def _renumber(entry):
-    entry["row_coords"].sort(key=lambda r: r["top"])
-    for i, rc in enumerate(entry["row_coords"], start=1):
-        rc["row"] = i
-
-
-def _commit(entry):
-    entry["highlighted"] = sorted(rc["row"] for rc in entry["row_coords"] if rc["flagged"])
-    entry["total_rows"] = len(entry["row_coords"])
-
-
-def _ensure_flagged_field(entry):
-    flagged_nums = set(entry.get("highlighted", []))
-    for rc in entry["row_coords"]:
-        rc.setdefault("flagged", rc["row"] in flagged_nums)
-
-
-@st.cache_data(max_entries=8, show_spinner=False)
-def _load_raw_image(raw_filepath: str):
-    """Decoding a raw screenshot is the single most expensive step in
-    the whole review screen — and _row_thumb was calling this fresh for
-    EVERY row of a screenshot, so a 12-row screenshot decoded the exact
-    same file 12 separate times (measured: 338 MB for one screenshot
-    alone, just from this redundancy). Caching by file path means it's
-    decoded once and reused for every row's thumbnail AND across
-    reruns (every checkbox click reruns the whole script). Capped at 8
-    entries so the cache itself can't grow unbounded across a batch of
-    hundreds of screenshots — only the few currently in view stay
-    cached, not everything ever opened this session."""
-    return Image.open(raw_filepath).convert("RGB")
-
-
-def _row_thumb(entry, rc, max_width=780):
-    raw = _load_raw_image(entry["raw_filepath"])
-    crop = raw.crop((0, rc["top"], entry["x_right"], rc["bottom"]))
-    if crop.width > max_width:
-        scale = max_width / crop.width
-        crop = crop.resize((max_width, max(1, int(crop.height * scale))))
-    return crop
-
-
 def _report_type_label(core):
     return "Google" if core is google_core else "Explorer"
 
 
 def _reviewed_indices(n_entries):
-    return [i for i in range(n_entries) if st.session_state.get(f"reviewed_{i}", False)]
+    entries = st.session_state["manifest"]["entries"]
+    return [i for i in range(n_entries) if entries[i].get("reviewed")]
 
 
 def _state_signature(manifest):
@@ -264,17 +239,19 @@ def _state_signature(manifest):
     import hashlib
     parts = []
     for i, e in enumerate(manifest["entries"]):
-        parts.append((e["file"], bool(st.session_state.get(f"reviewed_{i}", False)),
+        parts.append((e["file"], bool(e.get("reviewed")),
                       tuple((r["row"], r["top"], r["bottom"], bool(r.get("flagged")))
                             for r in e["row_coords"])))
     return hashlib.md5(repr(parts).encode()).hexdigest()
 
 
-def render_progress_saver(manifest):
+@st.fragment(run_every="2s")
+def render_progress_saver():
     """Review state lives only in the browser session, so a refresh wipes it.
     This produces a ZIP that can be re-opened from the upload page. Built on
     demand (not on every rerun) because it packs every original screenshot."""
     core = st.session_state["core"]
+    manifest = st.session_state["manifest"]
     with st.expander("💾 Save my progress — protects your edits against a refresh or closed tab"):
         st.caption(
             "Click **Prepare progress file**, download it, and keep it. If the page refreshes, "
@@ -304,20 +281,13 @@ def render_review_step():
     manifest = st.session_state["manifest"]
     st.title("Review")
 
-    total_rows = sum(len(e["row_coords"]) for e in manifest["entries"])
-    total_flagged = sum(len(e.get("highlighted", [])) for e in manifest["entries"])
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Screenshots", len(manifest["entries"]))
-    c2.metric("Rows detected", total_rows)
-    c3.metric("Rows flagged", total_flagged)
+    # Reserved here so it sits at the top, filled once the filters have been
+    # applied (it needs to know how many screenshots are showing). It
+    # refreshes itself, because edits only re-run their own screenshot.
+    summary_slot = st.container()
     st.caption("Flags shown here were parsed straight from each filename's `no …` list — "
                "correct anything that needs it below before building.")
-    # Reserved here (so it shows at the top) but FILLED after the screenshot
-    # panels below have run: a flag checkbox applies its change to the
-    # manifest while its panel renders, so a saver that ran first would
-    # fingerprint the page one edit behind and happily offer a stale
-    # progress file as if it were current.
-    saver_slot = st.container()
+    render_progress_saver()
     st.divider()
 
     filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
@@ -335,7 +305,7 @@ def render_review_step():
 
     visible_indices = []
     for idx, entry in enumerate(manifest["entries"]):
-        _ensure_flagged_field(entry)
+        review_ui.ensure_row_fields(entry)
         if kw_filter != "All" and entry["keyword"] != kw_filter:
             continue
         if week_filter != "All" and f"Week {entry['week_num']}" != week_filter:
@@ -349,7 +319,10 @@ def render_review_step():
             continue
         visible_indices.append(idx)
 
-    ec1, ec2, ec3 = st.columns([1, 1, 3])
+    with summary_slot:
+        review_ui.render_summary(tuple(visible_indices))
+
+    ec1, ec2, _ = st.columns([1, 1, 3])
     with ec1:
         if st.button("⬇️ Expand all", width="stretch"):
             for idx in visible_indices:
@@ -360,25 +333,10 @@ def render_review_step():
             for idx in visible_indices:
                 st.session_state[f"expander_{idx}"] = False
             st.rerun()
-    with ec3:
-        reviewed_n = sum(1 for idx in visible_indices
-                          if st.session_state.get(f"reviewed_{idx}", False))
-        st.caption(f"✅ Marked reviewed: {reviewed_n} of {len(visible_indices)} shown")
 
+    # One fragment per screenshot: a click inside it re-runs only that block.
     for idx in visible_indices:
-        entry = manifest["entries"][idx]
-        flagged_n = sum(1 for r in entry["row_coords"] if r["flagged"])
-        status_icon = "🔴" if flagged_n else "⚪"
-        reviewed_icon = "✅ " if st.session_state.get(f"reviewed_{idx}", False) else ""
-        with st.expander(
-            f"{reviewed_icon}{status_icon} **{entry['keyword']}** · Page {entry['page']} · Week {entry['week_num']} · "
-            f"{entry['date']} · {entry['file']} — {len(entry['row_coords'])} row(s), {flagged_n} flagged",
-            expanded=False, key=f"expander_{idx}",
-        ):
-            render_entry_panel(idx, entry)
-
-    with saver_slot:
-        render_progress_saver(manifest)
+        review_ui.render_entry_block(idx)
 
     st.divider()
     if st.button("🚀 Build Report", type="primary"):
@@ -398,98 +356,6 @@ def render_review_step():
         st.rerun()
 
 
-def render_entry_panel(idx, entry):
-    """Flag, delete, resize, or add rows — all through plain, fully
-    testable Streamlit widgets, no drag/canvas component involved at
-    all. Each row shows its thumbnail with Flag/Delete controls, plus
-    an 'Adjust boundaries' section for nudging its top/bottom pixel
-    position directly, with a live preview so it's not just guessing
-    blind numbers. A row keeps its own flag when resized — it's still
-    the same row, just a different crop, not a brand new one."""
-    top_l, top_r = st.columns([1, 1])
-    with top_l:
-        st.checkbox("✅ Mark this screenshot as reviewed", key=f"reviewed_{idx}")
-    with top_r:
-        bl, br = st.columns(2)
-        with bl:
-            if st.button("🚩 Flag all rows here", key=f"flagall_{idx}", width="stretch"):
-                for rc in entry["row_coords"]:
-                    rc["flagged"] = True
-                    # Once a checkbox has rendered with a given key, it
-                    # OWNS that value in session_state from then on and
-                    # ignores the value= parameter passed to it — so
-                    # setting rc["flagged"] alone here isn't enough, the
-                    # checkbox itself would just report its OLD stored
-                    # value on the next render and silently overwrite
-                    # this right back to what it was (confirmed this
-                    # exact failure directly: bulk-flagging changed the
-                    # data but every checkbox undid it one line later).
-                    # Updating the widget's own session_state entry
-                    # here is what actually makes the bulk action stick.
-                    st.session_state[f"flag_{idx}_{rc['row']}_{id(rc)}"] = True
-                _commit(entry)
-                st.rerun()
-        with br:
-            if st.button("Clear all flags here", key=f"unflagall_{idx}", width="stretch"):
-                for rc in entry["row_coords"]:
-                    rc["flagged"] = False
-                    st.session_state[f"flag_{idx}_{rc['row']}_{id(rc)}"] = False
-                _commit(entry)
-                st.rerun()
-    st.divider()
-
-    for rc in sorted(entry["row_coords"], key=lambda r: r["top"]):
-        c1, c2, c3 = st.columns([0.14, 0.1, 0.76])
-        with c1:
-            new_val = st.checkbox(f"🚩 Flag #{rc['row']}", value=rc["flagged"],
-                                   key=f"flag_{idx}_{rc['row']}_{id(rc)}")
-            if new_val != rc["flagged"]:
-                rc["flagged"] = new_val
-                _commit(entry)
-        with c2:
-            if st.button("✕ Delete", key=f"del_{idx}_{rc['row']}_{id(rc)}"):
-                entry["row_coords"] = [r for r in entry["row_coords"] if r is not rc]
-                _renumber(entry)
-                _commit(entry)
-                st.rerun()
-        with c3:
-            # "content" instead of "stretch" — screenshots from the
-            # automated capture pipeline now come in at a consistent
-            # width, so displaying at their own natural size (up to
-            # the 780px cap already applied in _row_thumb) keeps every
-            # thumbnail a predictable, readable size regardless of how
-            # wide the browser window happens to be, rather than being
-            # stretched blurry on a wide monitor or squeezed tiny on a
-            # narrow one.
-            st.image(_row_thumb(entry, rc), width="content")
-
-        with st.expander(f"↕️ Adjust the height/position of row #{rc['row']}"):
-            raw_h = _load_raw_image(entry["raw_filepath"]).height
-            ac1, ac2, ac3 = st.columns([1, 1, 1])
-            with ac1:
-                adj_top = st.number_input("Top", min_value=0, max_value=raw_h, value=rc["top"],
-                                           key=f"adjtop_{idx}_{rc['row']}_{id(rc)}")
-            with ac2:
-                adj_bottom = st.number_input("Bottom", min_value=0, max_value=raw_h, value=rc["bottom"],
-                                              key=f"adjbot_{idx}_{rc['row']}_{id(rc)}")
-            with ac3:
-                st.write("")
-                st.write("")
-                if st.button("Apply", key=f"apply_{idx}_{rc['row']}_{id(rc)}"):
-                    if adj_bottom > adj_top:
-                        rc["top"] = int(adj_top)
-                        rc["bottom"] = int(adj_bottom)
-                        _renumber(entry)
-                        _commit(entry)
-                        st.rerun()
-                    else:
-                        st.error("Bottom must be greater than Top.")
-            if adj_bottom > adj_top:
-                preview = _load_raw_image(entry["raw_filepath"]).crop(
-                    (0, int(adj_top), entry["x_right"], int(adj_bottom)))
-                st.image(preview, caption="Preview at these positions", width="stretch")
-
-
 # ════════════════════════════════════════════════════════════════════════
 # Step 3: Build + download
 # ════════════════════════════════════════════════════════════════════════
@@ -501,18 +367,30 @@ def render_build_step():
     report_root = st.session_state["report_root"]
 
     if "build_done" not in st.session_state:
-        with st.spinner("Building final images, CSV, and PPTX…"):
-            total_images, total_highlighted, csv_path, pptx_path = core.build_report_from_manifest(
-                report_root, manifest, manifest.get("template_path"),
-                extra_csv_results=st.session_state.get("extra_csv_results"))
-            st.session_state["build_done"] = True
-            st.session_state["build_summary"] = (total_images, total_highlighted, csv_path, pptx_path)
-            # A fresh build invalidates any previously packaged download.
-            st.session_state.pop("bundle_bytes", None)
-            st.session_state.pop("bundle_sources", None)
+        try:
+            with st.spinner("Building final images, CSV, and PPTX…"):
+                total_images, total_highlighted, csv_path, pptx_path = core.build_report_from_manifest(
+                    report_root, manifest, manifest.get("template_path"),
+                    extra_csv_results=st.session_state.get("extra_csv_results"))
+        except Exception as exc:
+            st.error(f"The build failed: {type(exc).__name__}: {exc}")
+            with st.expander("Technical details"):
+                st.code(traceback.format_exc())
+            if st.button("◀ Back to review"):
+                st.session_state["step"] = "review"
+                st.rerun()
+            st.stop()
+        st.session_state["build_done"] = True
+        st.session_state["build_summary"] = (total_images, total_highlighted, csv_path, pptx_path)
+        # A fresh build invalidates any previously packaged download.
+        st.session_state.pop("bundle_bytes", None)
+        st.session_state.pop("bundle_sources", None)
 
     total_images, total_highlighted, csv_path, pptx_path = st.session_state["build_summary"]
     st.success(f"✅ {total_images} image(s) built, {total_highlighted} row(s) flagged.")
+    if manifest.get("_pptx_error"):
+        st.warning(f"The CSV and images were built, but the PowerPoint couldn't be: "
+                   f"{manifest['_pptx_error']}")
 
     include_sources = st.checkbox(
         "Include the original screenshots in the download (lets you re-open and re-review this "
