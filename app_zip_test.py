@@ -28,6 +28,9 @@ from PIL import Image
 
 import monthly_seo_report_google as google_core
 import monthly_seo_report_explorer as explorer_core
+import review_session
+
+CORES = {"Google": google_core, "Explorer": explorer_core}
 
 # Streamlit Cloud's actual allocated memory is much smaller than what
 # os.cpu_count() reports from the underlying host — the core scripts'
@@ -50,7 +53,7 @@ MONTH_NAMES = [
 # bottom of the sidebar so it's possible to tell AT A GLANCE, just by
 # looking at the running app, whether it's actually running the latest
 # code or an older cached/undeployed version. No more guessing.
-APP_BUILD = "2026-09-22-no-canvas"
+APP_BUILD = "2026-10-13-full-page-read"
 
 st.set_page_config(page_title="SEO Report Builder — ZIP test", layout="wide", page_icon="🧪")
 st.sidebar.caption(f"Build: {APP_BUILD}")
@@ -107,6 +110,50 @@ def render_upload_step():
     if st.button("🔎 Scan & Detect", type="primary", disabled=zip_file is None):
         with st.spinner("Extracting and detecting rows — this can take a while for a lot of screenshots…"):
             _run_detection(report_type, year, month_name, zip_file, template_file)
+
+    st.divider()
+    with st.expander("♻️ Re-open a review I downloaded earlier (also how to recover after a refresh)"):
+        st.caption(
+            "Upload the report ZIP you downloaded from this app — or a **progress file** saved "
+            "mid-review — and you're back on the review screen with every flag, height change, "
+            "added/deleted row and 'reviewed' tick exactly as you left them. Nothing is re-scanned.")
+        resume_zip = st.file_uploader("Downloaded report or progress ZIP", type=["zip"], key="resume_zip")
+        resume_orig = st.file_uploader(
+            "Original month ZIP — only needed if the report was downloaded BEFORE this feature "
+            "existed (older downloads don't contain the screenshots)",
+            type=["zip"], key="resume_orig")
+        if st.button("♻️ Re-open review", disabled=resume_zip is None):
+            _run_resume(resume_zip, resume_orig)
+
+
+def _run_resume(resume_zip, resume_orig):
+    try:
+        with st.spinner("Restoring your review…"):
+            res = review_session.restore_bundle(
+                resume_zip.getbuffer(), CORES,
+                resume_orig.getbuffer() if resume_orig is not None else None)
+    except review_session.MissingScreenshotsError as e:
+        st.error(
+            f"{e}. This file doesn't contain the original screenshots, so it can't be re-opened "
+            "on its own. Either upload the original month ZIP in the second box above, or — if you "
+            "still have the month ZIP — run Scan & Detect once and download again from this version "
+            "(that download will be re-openable).")
+        return
+    except Exception as e:  # corrupt/foreign file — say so plainly instead of a stack trace
+        st.error(f"Couldn't re-open that file: {e}")
+        return
+
+    st.session_state.update({
+        "work_dir": res["work_dir"], "report_root": res["report_root"],
+        "manifest": res["manifest"], "core": res["core"],
+        "template_path": res["template_path"], "extra_csv_results": res["extra_csv_results"],
+        "step": "review",
+    })
+    for key in ("build_done", "build_summary", "bundle_bytes", "bundle_sources", "progress_bytes"):
+        st.session_state.pop(key, None)
+    for idx in res["reviewed_indices"]:
+        st.session_state[f"reviewed_{idx}"] = True
+    st.rerun()
 
 
 def run_detection_core(report_type, year, month_name, zip_bytes, template_bytes=None, template_filename=None):
@@ -203,6 +250,56 @@ def _row_thumb(entry, rc, max_width=780):
     return crop
 
 
+def _report_type_label(core):
+    return "Google" if core is google_core else "Explorer"
+
+
+def _reviewed_indices(n_entries):
+    return [i for i in range(n_entries) if st.session_state.get(f"reviewed_{i}", False)]
+
+
+def _state_signature(manifest):
+    """Cheap fingerprint of everything worth saving — used to tell whether a
+    previously prepared progress file still matches what's on screen."""
+    import hashlib
+    parts = []
+    for i, e in enumerate(manifest["entries"]):
+        parts.append((e["file"], bool(st.session_state.get(f"reviewed_{i}", False)),
+                      tuple((r["row"], r["top"], r["bottom"], bool(r.get("flagged")))
+                            for r in e["row_coords"])))
+    return hashlib.md5(repr(parts).encode()).hexdigest()
+
+
+def render_progress_saver(manifest):
+    """Review state lives only in the browser session, so a refresh wipes it.
+    This produces a ZIP that can be re-opened from the upload page. Built on
+    demand (not on every rerun) because it packs every original screenshot."""
+    core = st.session_state["core"]
+    with st.expander("💾 Save my progress — protects your edits against a refresh or closed tab"):
+        st.caption(
+            "Click **Prepare progress file**, download it, and keep it. If the page refreshes, "
+            "upload it under *Re-open a review* on the first screen and carry on where you "
+            "stopped. Prepare it again after making more edits.")
+        if st.button("📦 Prepare progress file", key="prep_progress"):
+            with st.spinner("Packing your review (includes the original screenshots)…"):
+                st.session_state["progress_bytes"] = review_session.build_bundle_zip(
+                    core, st.session_state["report_root"], manifest, _report_type_label(core),
+                    st.session_state.get("template_path"), st.session_state.get("extra_csv_results"),
+                    _reviewed_indices(len(manifest["entries"])), include_sources=True)
+                st.session_state["progress_sig"] = _state_signature(manifest)
+        if "progress_bytes" in st.session_state:
+            if st.session_state.get("progress_sig") == _state_signature(manifest):
+                name = (f"{_report_type_label(core)}_SEO_Review_IN_PROGRESS_"
+                        f"{manifest['month_name']}_{manifest['year']}.zip")
+                size_mb = len(st.session_state["progress_bytes"]) / 1_000_000
+                st.download_button(f"⬇️ Download progress file ({size_mb:.1f} MB)",
+                                   data=st.session_state["progress_bytes"], file_name=name,
+                                   mime="application/zip", key="dl_progress")
+            else:
+                st.warning("You've made changes since this file was prepared — click "
+                           "**Prepare progress file** again so it includes them.")
+
+
 def render_review_step():
     manifest = st.session_state["manifest"]
     st.title("Review")
@@ -215,6 +312,12 @@ def render_review_step():
     c3.metric("Rows flagged", total_flagged)
     st.caption("Flags shown here were parsed straight from each filename's `no …` list — "
                "correct anything that needs it below before building.")
+    # Reserved here (so it shows at the top) but FILLED after the screenshot
+    # panels below have run: a flag checkbox applies its change to the
+    # manifest while its panel renders, so a saver that ran first would
+    # fingerprint the page one edit behind and happily offer a stale
+    # progress file as if it were current.
+    saver_slot = st.container()
     st.divider()
 
     filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
@@ -230,6 +333,7 @@ def render_review_step():
     with filter_col4:
         show_filter = st.selectbox("Show", ["All screenshots", "Only flagged", "Only unflagged"])
 
+    visible_indices = []
     for idx, entry in enumerate(manifest["entries"]):
         _ensure_flagged_field(entry)
         if kw_filter != "All" and entry["keyword"] != kw_filter:
@@ -243,15 +347,38 @@ def render_review_step():
             continue
         if show_filter == "Only unflagged" and has_flagged:
             continue
+        visible_indices.append(idx)
 
+    ec1, ec2, ec3 = st.columns([1, 1, 3])
+    with ec1:
+        if st.button("⬇️ Expand all", width="stretch"):
+            for idx in visible_indices:
+                st.session_state[f"expander_{idx}"] = True
+            st.rerun()
+    with ec2:
+        if st.button("⬆️ Collapse all", width="stretch"):
+            for idx in visible_indices:
+                st.session_state[f"expander_{idx}"] = False
+            st.rerun()
+    with ec3:
+        reviewed_n = sum(1 for idx in visible_indices
+                          if st.session_state.get(f"reviewed_{idx}", False))
+        st.caption(f"✅ Marked reviewed: {reviewed_n} of {len(visible_indices)} shown")
+
+    for idx in visible_indices:
+        entry = manifest["entries"][idx]
         flagged_n = sum(1 for r in entry["row_coords"] if r["flagged"])
         status_icon = "🔴" if flagged_n else "⚪"
+        reviewed_icon = "✅ " if st.session_state.get(f"reviewed_{idx}", False) else ""
         with st.expander(
-            f"{status_icon} **{entry['keyword']}** · Page {entry['page']} · Week {entry['week_num']} · "
+            f"{reviewed_icon}{status_icon} **{entry['keyword']}** · Page {entry['page']} · Week {entry['week_num']} · "
             f"{entry['date']} · {entry['file']} — {len(entry['row_coords'])} row(s), {flagged_n} flagged",
             expanded=False, key=f"expander_{idx}",
         ):
             render_entry_panel(idx, entry)
+
+    with saver_slot:
+        render_progress_saver(manifest)
 
     st.divider()
     if st.button("🚀 Build Report", type="primary"):
@@ -266,6 +393,7 @@ def render_review_step():
         # runs again against whatever the manifest looks like right now.
         st.session_state.pop("build_done", None)
         st.session_state.pop("build_summary", None)
+        st.session_state.pop("progress_bytes", None)
         st.session_state["step"] = "build"
         st.rerun()
 
@@ -278,6 +406,38 @@ def render_entry_panel(idx, entry):
     position directly, with a live preview so it's not just guessing
     blind numbers. A row keeps its own flag when resized — it's still
     the same row, just a different crop, not a brand new one."""
+    top_l, top_r = st.columns([1, 1])
+    with top_l:
+        st.checkbox("✅ Mark this screenshot as reviewed", key=f"reviewed_{idx}")
+    with top_r:
+        bl, br = st.columns(2)
+        with bl:
+            if st.button("🚩 Flag all rows here", key=f"flagall_{idx}", width="stretch"):
+                for rc in entry["row_coords"]:
+                    rc["flagged"] = True
+                    # Once a checkbox has rendered with a given key, it
+                    # OWNS that value in session_state from then on and
+                    # ignores the value= parameter passed to it — so
+                    # setting rc["flagged"] alone here isn't enough, the
+                    # checkbox itself would just report its OLD stored
+                    # value on the next render and silently overwrite
+                    # this right back to what it was (confirmed this
+                    # exact failure directly: bulk-flagging changed the
+                    # data but every checkbox undid it one line later).
+                    # Updating the widget's own session_state entry
+                    # here is what actually makes the bulk action stick.
+                    st.session_state[f"flag_{idx}_{rc['row']}_{id(rc)}"] = True
+                _commit(entry)
+                st.rerun()
+        with br:
+            if st.button("Clear all flags here", key=f"unflagall_{idx}", width="stretch"):
+                for rc in entry["row_coords"]:
+                    rc["flagged"] = False
+                    st.session_state[f"flag_{idx}_{rc['row']}_{id(rc)}"] = False
+                _commit(entry)
+                st.rerun()
+    st.divider()
+
     for rc in sorted(entry["row_coords"], key=lambda r: r["top"]):
         c1, c2, c3 = st.columns([0.14, 0.1, 0.76])
         with c1:
@@ -293,7 +453,15 @@ def render_entry_panel(idx, entry):
                 _commit(entry)
                 st.rerun()
         with c3:
-            st.image(_row_thumb(entry, rc), width="stretch")
+            # "content" instead of "stretch" — screenshots from the
+            # automated capture pipeline now come in at a consistent
+            # width, so displaying at their own natural size (up to
+            # the 780px cap already applied in _row_thumb) keeps every
+            # thumbnail a predictable, readable size regardless of how
+            # wide the browser window happens to be, rather than being
+            # stretched blurry on a wide monitor or squeezed tiny on a
+            # narrow one.
+            st.image(_row_thumb(entry, rc), width="content")
 
         with st.expander(f"↕️ Adjust the height/position of row #{rc['row']}"):
             raw_h = _load_raw_image(entry["raw_filepath"]).height
@@ -374,26 +542,45 @@ def render_build_step():
                 extra_csv_results=st.session_state.get("extra_csv_results"))
             st.session_state["build_done"] = True
             st.session_state["build_summary"] = (total_images, total_highlighted, csv_path, pptx_path)
+            # A fresh build invalidates any previously packaged download.
+            st.session_state.pop("bundle_bytes", None)
+            st.session_state.pop("bundle_sources", None)
 
     total_images, total_highlighted, csv_path, pptx_path = st.session_state["build_summary"]
     st.success(f"✅ {total_images} image(s) built, {total_highlighted} row(s) flagged.")
 
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(report_root):
-            for fname in files:
-                full = os.path.join(root, fname)
-                zf.write(full, os.path.relpath(full, report_root))
-    zip_buf.seek(0)
+    include_sources = st.checkbox(
+        "Include the original screenshots in the download (lets you re-open and re-review this "
+        "report later, even after a refresh)", value=True, key="include_sources")
+
+    # Packaged once per build (and again only if that checkbox changes) —
+    # NOT on every rerun, since this now packs every original screenshot.
+    if ("bundle_bytes" not in st.session_state
+            or st.session_state.get("bundle_sources") != include_sources):
+        with st.spinner("Packaging your download…"):
+            st.session_state["bundle_bytes"] = review_session.build_bundle_zip(
+                core, report_root, manifest, _report_type_label(core),
+                manifest.get("template_path"), st.session_state.get("extra_csv_results"),
+                _reviewed_indices(len(manifest["entries"])), include_sources=include_sources)
+            st.session_state["bundle_sources"] = include_sources
 
     # Named after the report itself (type, month, year) rather than a
     # generic "report.zip" — matters once you're juggling downloads
     # from more than one month or more than one report type at a time.
-    report_type_label = "Google" if core is google_core else "Explorer"
-    zip_filename = f"{report_type_label}_SEO_Report_{manifest['month_name']}_{manifest['year']}.zip"
+    zip_filename = f"{_report_type_label(core)}_SEO_Report_{manifest['month_name']}_{manifest['year']}.zip"
+    size_mb = len(st.session_state["bundle_bytes"]) / 1_000_000
 
-    st.download_button("⬇️ Download full report (ZIP)", data=zip_buf,
+    st.download_button(f"⬇️ Download full report (ZIP, {size_mb:.1f} MB)",
+                        data=st.session_state["bundle_bytes"],
                         file_name=zip_filename, mime="application/zip", type="primary")
+    if include_sources:
+        st.caption("The CSV, PPTX and images are at the top level of the ZIP, same as always. "
+                   "The `_review_session` folder inside holds your original screenshots and review "
+                   "state — leave it in, and you can upload this exact file under *Re-open a review* "
+                   "on the first screen to pick up where you left off.")
+    else:
+        st.caption("Report files only — this download can't be re-opened for review on its own "
+                   "(you'd also need the original month ZIP).")
 
     col1, col2 = st.columns(2)
     with col1:
