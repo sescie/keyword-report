@@ -61,6 +61,7 @@ import re
 import sys
 import threading
 import traceback
+import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -1341,8 +1342,55 @@ def classify_template_slides(prs) -> dict:
     return {"title": idx_title, "divider": idx_divider, "result": idx_result, "conclusion": idx_conclusion}
 
 
+# ── PowerPoint templates ────────────────────────────────────────────────
+# python-pptx only opens files whose internal content type says "presentation".
+# A .potx (the format PowerPoint saves a TEMPLATE in — and this app's uploader
+# accepts it) is the same package with a different content type, so
+# Presentation(path) raised a ValueError and, uncaught, took the whole build
+# down even though the CSV and every image were already finished. Re-labelling
+# the content type makes it open exactly like a normal .pptx.
+_PPTX_MAIN_CT = "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+_PPTX_OTHER_CT = (
+    "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",     # .potx
+    "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",    # .ppsx
+    "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",                   # .pptm
+    "application/vnd.ms-powerpoint.template.macroEnabled.main+xml",                       # .potm
+    "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",                      # .ppsm
+)
+
+
+def normalize_template(path):
+    """Return a path python-pptx can open: the file itself if it's already a
+    normal presentation, otherwise a converted copy next to it. Raises
+    ValueError with a plain-English message if it isn't a PowerPoint file."""
+    path = str(path)
+    if not zipfile.is_zipfile(path):
+        raise ValueError(
+            "That template isn't a modern PowerPoint file (.pptx / .potx). If it's an old "
+            ".ppt, open it in PowerPoint and Save As .pptx first.")
+    with zipfile.ZipFile(path) as zin:
+        try:
+            ct = zin.read("[Content_Types].xml").decode("utf-8")
+        except KeyError:
+            raise ValueError("That file doesn't look like a PowerPoint presentation.")
+        if _PPTX_MAIN_CT in ct:
+            return path
+        if not any(alt in ct for alt in _PPTX_OTHER_CT):
+            raise ValueError("That file is a ZIP but not a PowerPoint presentation or template.")
+        for alt in _PPTX_OTHER_CT:
+            ct = ct.replace(alt, _PPTX_MAIN_CT)
+        out = os.path.splitext(path)[0] + "_converted.pptx"
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "[Content_Types].xml":
+                    data = ct.encode("utf-8")
+                zout.writestr(item, data)
+    return out
+
+
 def build_pptx(template_path, out_path, month_name, year, week_groups, summary_text):
-    prs = Presentation(template_path)
+    prs = Presentation(normalize_template(template_path))
     n_original = len(prs.slides._sldIdLst)
     slide_w = prs.slide_width
 
@@ -1533,6 +1581,10 @@ def build_report_from_manifest(report_root, manifest, template_path=None, extra_
 
     pptx_path = None
     template_path = template_path or manifest.get("template_path")
+    manifest.pop("_pptx_error", None)
+    if template_path and not os.path.exists(template_path):
+        manifest["_pptx_error"] = (f"The PowerPoint template file wasn't found "
+                                   f"({os.path.basename(str(template_path))}), so no PPTX was made.")
     if template_path and os.path.exists(template_path) and manifest["entries"]:
         month_name, year = manifest["month_name"], manifest["year"]
         pptx_path = os.path.join(report_root, f"Google_SEO_Report_{month_name}_{year}.pptx")
@@ -1543,7 +1595,14 @@ def build_report_from_manifest(report_root, manifest, template_path=None, extra_
             f"result row(s) flagged for court/legal/financial-crime related mentions requiring "
             f"follow-up."
         )
-        build_pptx(template_path, pptx_path, month_name, year, week_groups, summary_text)
+        try:
+            build_pptx(template_path, pptx_path, month_name, year, week_groups, summary_text)
+        except Exception as exc:
+            # The CSV and all the images are already written. Report the
+            # PowerPoint problem instead of letting it abort the whole build.
+            log(f"  \u2717  PowerPoint could not be built: {type(exc).__name__}: {exc}")
+            manifest["_pptx_error"] = f"{type(exc).__name__}: {exc}"
+            pptx_path = None
 
     save_manifest(report_root, manifest["entries"], manifest["month_name"], manifest["year"],
                   manifest["month_num"], template_path)
