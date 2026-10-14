@@ -440,6 +440,277 @@ def detect_row_boundaries_by_gaps(arr: np.ndarray, y_top: int, y_bottom: int,
     return _merge_undersized_rows(boundaries)
 
 
+# ════════════════════════════════════════════════════════════════════════
+# Result-layout detection (scale-, theme- and header-independent)
+#
+# The original chain — detect_results_area / trim_bottom /
+# refine_first_row_top / detect_row_boundaries_by_gaps — was tuned on one
+# screenshot scale and leaned on fixed pixel constants and a "strongly
+# blue title" colour test. On other captures that produced silent,
+# partial reads (confirmed on real screenshots):
+#   * trim_bottom cut the page at the single LARGEST whitespace gap in the
+#     lower half. When every gap between results is nearly the same size
+#     (31/32/33px), which one "wins" is arbitrary, and everything below it
+#     — here results 7-10 — was never read.
+#   * detect_results_area looked for strongly blue title pixels; anti-
+#     aliased link text at 1x scale barely contains any, so the "top of
+#     the results" landed half way down the page and the first half was
+#     skipped.
+#   * refine_first_row_top took the TOPMOST blank run in its window, which
+#     pulled the search-tabs bar ("All / Images / Videos…") into row 1.
+#   * min_gap=28px assumed one scale; ink was "darker than 210", which
+#     treats an entire dark-mode page as ink.
+# detect_result_layout() replaces all of that with measurements taken from
+# the image itself. The old chain remains as the fallback if this finds
+# nothing usable.
+# ════════════════════════════════════════════════════════════════════════
+
+_INK_DIFF = 45          # how far from the page background a pixel must be to count as ink
+_GUTTER_DIFF = 30       # same, for finding the empty gutter right of the results column
+_SHORT_BLOCK_RATIO = 0.65  # a trailing/leading block shorter than this x a typical result is page chrome (results ~90px, pagination ~43px, footer ~45px)
+
+
+def _background_color(arr: np.ndarray) -> np.ndarray:
+    sample = arr[::8, ::8].reshape(-1, 3)
+    return np.median(sample, axis=0).astype(np.int16)
+
+
+def _diff_map(arr: np.ndarray, bg: np.ndarray) -> np.ndarray:
+    """Per-pixel distance from the page background (works for light AND dark
+    pages). Built in row chunks so a very tall screenshot doesn't need a
+    full-size int16 copy in memory."""
+    H, W = arr.shape[:2]
+    out = np.empty((H, W), dtype=np.uint8)
+    step = 256
+    for y in range(0, H, step):
+        chunk = arr[y:y + step].astype(np.int16)
+        d = np.minimum(np.abs(chunk - bg).max(axis=2), 255).astype(np.uint8)
+        # Older captures have hand-drawn red boxes around flagged results.
+        # Those outlines hug each result and eat into the whitespace between
+        # results (36px gap - box padding ~ 26px, under the row threshold),
+        # which merged whole pages into one or two rows. Strongly red pixels
+        # are therefore not counted as page content.
+        R, G, B = chunk[..., 0], chunk[..., 1], chunk[..., 2]
+        d[(R > 140) & (G < 90) & (B < 90) & ((R - G) > 80)] = 0
+        out[y:y + step] = d
+    return out
+
+
+def _header_separator_end(diff: np.ndarray) -> int:
+    """Google and Bing both draw one hairline across the whole page under the
+    search box / tabs. If there is one near the top, with header content
+    above it, the results start below it. Returns 0 when there isn't (the
+    header was already trimmed off, or there never was one).
+
+    Takes the FIRST such line, not the last: on a tightly cropped capture a
+    later divider inside the results (the full-width rule above a "People
+    also ask" box, say) must not be mistaken for the end of the header and
+    swallow real results. If a second header line does exist, the header
+    text left between the two is short, and the leading-chrome rule in
+    detect_result_layout drops it."""
+    H, W = diff.shape
+    faint = (diff >= 6) & (diff <= 80)
+    cov = faint.mean(axis=1)
+    inked_row = (diff > _INK_DIFF).sum(axis=1) > 3
+    limit = int(H * 0.25)
+    y = 0
+    while y < limit:
+        if cov[y] >= 0.80:
+            y2 = y
+            while y2 + 1 < H and cov[y2 + 1] >= 0.80:
+                y2 += 1
+            # a hairline is thin (a tall tinted panel is not a separator),
+            # and a header separator has header content above it
+            if (y2 - y + 1) <= 4 and int(inked_row[:y].sum()) >= 25:
+                return y2 + 2
+            y = y2 + 1
+        else:
+            y += 1
+    return 0
+
+
+def _gutter_x_right(diff: np.ndarray, y0: int, y1: int) -> int:
+    H, W = diff.shape
+    x0 = int(W * 0.45)
+    region = diff[y0:y1, x0:W] > _GUTTER_DIFF
+    nonwhite = region.sum(axis=0)
+    white = nonwhite < 0.02 * max(1, (y1 - y0))
+    min_gutter = int(0.035 * W)
+    run = 0
+    start = 0
+    for i, w in enumerate(white):
+        if w:
+            if run == 0:
+                start = i
+            run += 1
+            if run >= min_gutter:
+                return x0 + start
+        else:
+            run = 0
+    return W
+
+
+def _footer_band_start(diff: np.ndarray) -> int | None:
+    """Google and Bing end the page with a full-width tinted band (the footer)
+    that runs to the bottom of the screenshot. Returns where it starts, or
+    None. It has to reach the bottom of the image, so a tinted panel in the
+    middle of the results (an AI answer box, say) is never mistaken for it."""
+    H, W = diff.shape
+    tint = ((diff >= 3) & (diff <= 40)).mean(axis=1) >= 0.60
+    y0 = int(H * 0.50)
+    for y in range(y0, H - 6):
+        if tint[y] and tint[y:].mean() >= 0.90:
+            return y
+    return None
+
+
+def _content_x_left(diff: np.ndarray, y0: int, y1: int, x_right: int) -> int:
+    """Left edge of the results column. Capped at the old fixed 160 (which
+    skipped margin clutter on full-window captures) but allowed to be lower
+    when the capture is already trimmed. Columns that are inked down nearly
+    the whole height (a border line, a scrollbar) are ignored."""
+    rows = max(1, y1 - y0)
+    colink = (diff[y0:y1, :x_right] > _INK_DIFF).sum(axis=0)
+    good = np.where((colink > 2) & (colink < 0.9 * rows))[0]
+    first = int(good[0]) if len(good) else 160
+    return max(0, min(160, first))
+
+
+def _adaptive_min_gap(line_height: float | None) -> float:
+    """Whitespace-gap size that separates 'between two results' from 'between
+    lines inside one result'.
+
+    28px is the proven value for normal-size captures: on every real one
+    checked, results sit 30-40px apart and lines inside a result at most
+    ~25px. It is only scaled DOWN, and only when the text itself is clearly
+    smaller than normal. Text size is read straight from the image as the
+    median height of a line of text (normal captures measure 12-21px; a
+    browser window zoomed way out measures ~5px, and its result gaps shrink
+    with it, so a fixed 28px merges the whole page into one row).
+
+    Never scaled up, and deliberately NOT derived from the spread of gap
+    sizes: three such rules were tried (biggest jump between neighbouring
+    gaps, a two-class split, median gap) and each got pulled the wrong way
+    by something ordinary — one stray pagination-to-footer gap, or Bing's
+    many mid-sized gaps — merging or over-splitting whole pages."""
+    if not line_height:
+        return 28.0
+    scale = line_height / 12.0
+    if scale >= 0.75:
+        return 28.0
+    return float(max(6.0, 28.0 * scale))
+
+
+def detect_result_layout(arr: np.ndarray):
+    """Returns (boundaries, x_right) — row boundaries covering ALL the result
+    blocks on the page, or None if nothing usable was found."""
+    H, W = arr.shape[:2]
+    if H < 120 or W < 160:
+        return None
+
+    bg = _background_color(arr)
+    diff = _diff_map(arr, bg)
+
+    y_start = _header_separator_end(diff)
+    x_right = _gutter_x_right(diff, y_start, H)
+    x_left = _content_x_left(diff, y_start, H, x_right)
+    if x_right - x_left < 80:
+        return None
+
+    ink = (diff[:, x_left:x_right] > _INK_DIFF).sum(axis=1) > 3
+    ink[:y_start] = False
+    idx = np.where(ink)[0]
+    if len(idx) == 0:
+        return None
+    first_ink, last_ink = int(idx[0]), int(idx[-1])
+
+    gaps = []
+    gs = None
+    for y in range(first_ink, last_ink + 1):
+        if not ink[y]:
+            if gs is None:
+                gs = y
+        elif gs is not None:
+            gaps.append((gs, y))
+            gs = None
+    runs, r = [], 0
+    for y in range(first_ink, last_ink + 1):
+        if ink[y]:
+            r += 1
+        elif r:
+            runs.append(r)
+            r = 0
+    if r:
+        runs.append(r)
+    text_runs = [x for x in runs if 3 <= x <= 45]
+    line_height = float(np.median(text_runs)) if len(text_runs) >= 6 else None
+    min_gap = _adaptive_min_gap(line_height)
+
+    blocks = []
+    cur = first_ink
+    for a, b in gaps:
+        if b - a >= min_gap:
+            blocks.append((cur, a))
+            cur = b
+    blocks.append((cur, last_ink + 1))
+    if not blocks:
+        return None
+
+    # Pagination ("Goooogle 1 2 3 … Next") and footer lines are short next to
+    # a real result; so is anything left of a header with no separator line.
+    heights = sorted(e - s for s, e in blocks)
+    # "Typical result" = the middle of the distribution. Taking the top half
+    # (an earlier version) let tall Images/Videos carousels (400-600px) set the
+    # yardstick, so genuine ~150px results looked like chrome and the first
+    # ones on a Bing page were thrown away.
+    k = int(0.2 * len(heights)) if len(heights) >= 6 else 0
+    typical = float(np.median(heights[k:len(heights) - k]))
+    band = _footer_band_start(diff)
+    if band is not None:
+        kept = [b for b in blocks if b[0] < band - 1]
+        blocks = kept or blocks
+
+    def _left_edge(blk):
+        cols = np.where((diff[blk[0]:blk[1], x_left:x_right] > _INK_DIFF).any(axis=0))[0]
+        return int(cols[0]) if len(cols) else 0
+
+    lefts = [_left_edge(b) for b in blocks]
+    col_left = float(np.median(lefts))
+    off_centre = 0.10 * (x_right - x_left)
+
+    def _is_chrome(blk):
+        if (blk[1] - blk[0]) < _SHORT_BLOCK_RATIO * typical:
+            return True
+        # pagination ("Goooogle 1 2 3 … Next") is centred under the results,
+        # whereas results, carousels and chips all start at the left edge
+        return (_left_edge(blk) - col_left) > off_centre
+
+    while len(blocks) > 1 and _is_chrome(blocks[-1]):
+        blocks.pop()
+    while len(blocks) > 1 and (blocks[0][1] - blocks[0][0]) < _SHORT_BLOCK_RATIO * typical:
+        blocks.pop(0)
+
+    s0 = blocks[0][0]
+    prev_end = y_start
+    for a, b in gaps:
+        if b <= s0:
+            prev_end = a
+    pad = min(14, max(2, (s0 - prev_end) // 2))
+    top = max(y_start, s0 - pad)
+    bounds = [top]
+    for (s1, e1), (s2, e2) in zip(blocks, blocks[1:]):
+        bounds.append((e1 + s2) // 2)
+    bounds.append(min(H, blocks[-1][1] + 12))
+
+    bounds = _merge_undersized_rows(bounds)
+    if len(bounds) < 3:
+        # A single row spanning a whole results page means the gaps weren't
+        # recognised (an unusual scale, say) — hand over to the original
+        # detector instead of accepting one giant row.
+        return None
+    return bounds, x_right
+
+
 def detect_row_boundaries(arr: np.ndarray, y_top: int, y_bottom: int, total: int, W: int,
                            x_right: int) -> list[int]:
     avg = (y_bottom - y_top) / total
@@ -563,12 +834,21 @@ def detect_rows_for_review(image_path, page_hint: int | None = None) -> dict:
         page, r_first, r_last = 1, 1, 10
         ocr_total = 10
 
-    y_top, y_bottom = detect_results_area(arr)
-    x_right = content_right_edge(arr, y_top, y_bottom, W)
-    y_bottom = trim_bottom(arr, y_top, y_bottom, x_right)
-    y_top = refine_first_row_top(arr, y_top, x_right)
-
-    gap_boundaries = detect_row_boundaries_by_gaps(arr, y_top, y_bottom, x_right)
+    layout = detect_result_layout(arr)
+    if layout is not None:
+        gap_boundaries, x_right = layout
+    else:
+        # fallback: the original colour/gap chain
+        layout = detect_result_layout(arr)
+        if layout is not None:
+            gap_boundaries, x_right = layout
+        else:
+            # fallback: the original colour/gap chain
+            y_top, y_bottom = detect_results_area(arr)
+            x_right = content_right_edge(arr, y_top, y_bottom, W)
+            y_bottom = trim_bottom(arr, y_top, y_bottom, x_right)
+            y_top = refine_first_row_top(arr, y_top, x_right)
+            gap_boundaries = detect_row_boundaries_by_gaps(arr, y_top, y_bottom, x_right)
     if gap_boundaries is not None:
         boundaries = gap_boundaries
         total = len(boundaries) - 1
